@@ -95,7 +95,11 @@ impl cosmic::Application for AppModel {
                         conn_opt = Connection::make_connection().await.ok();
                     }
                     if let Some(conn) = &mut conn_opt {
-                        if conn.push_request(Request::Action(action.clone())).await.is_err() {
+                        if conn
+                            .push_request(Request::Action(action.clone()))
+                            .await
+                            .is_err()
+                        {
                             // Retry once on failure
                             conn_opt = Connection::make_connection().await.ok();
                             if let Some(conn2) = &mut conn_opt {
@@ -138,6 +142,7 @@ impl cosmic::Application for AppModel {
         let icon_f = icon_size as f32;
         let btn_padding = (icon_f * 0.15).max(1.0);
         let row_spacing = (icon_f * 0.20).max(1.0);
+        let divider_block_padding = (icon_f * 0.30).max(3.0);
         let dot_width = (icon_f * 0.50).max(4.0);
         let dot_height = (icon_f * 0.10).max(2.0);
         let dot_radius = dot_height / 2.0;
@@ -184,7 +189,7 @@ impl cosmic::Application for AppModel {
                                 cosmic::widget::container(
                                     cosmic::widget::divider::vertical::default(),
                                 )
-                                .padding([0, btn_padding as u16]),
+                                .padding([divider_block_padding as u16, btn_padding as u16]),
                             );
                         }
                     }
@@ -259,14 +264,11 @@ impl cosmic::Application for AppModel {
                     .on_middle_press(Message::CloseWindow(window.id));
 
                 let title = window.title.clone().unwrap_or_else(|| "Window".to_string());
-                let tooltip = self.core.applet.applet_tooltip(
-                    area,
-                    title,
-                    false,
-                    Message::Surface,
-                    None,
-                );
-                
+                let tooltip =
+                    self.core
+                        .applet
+                        .applet_tooltip(area, title, false, Message::Surface, None);
+
                 row = row.push(tooltip);
             }
         }
@@ -353,7 +355,7 @@ impl cosmic::Application for AppModel {
                         }
                     }
                     self.resolve_icon(&window);
-                    
+
                     if let Some(idx) = self.windows.iter().position(|w| w.id == window.id) {
                         self.windows[idx] = window;
                     } else {
@@ -393,7 +395,9 @@ impl cosmic::Application for AppModel {
             }
             Message::CloseWindow(window_id) => {
                 if let Some(tx) = &mut self.action_tx {
-                    let _ = tx.try_send(Action::CloseWindow { id: Some(window_id) });
+                    let _ = tx.try_send(Action::CloseWindow {
+                        id: Some(window_id),
+                    });
                 }
             }
             Message::WorkspaceScrollDown => {
@@ -437,14 +441,13 @@ impl AppModel {
             .app_id
             .clone()
             .unwrap_or_else(|| "preferences-system-windows-symbolic".to_string());
-        
+
         let icon_name = crate::utils::find_fallback_icon(&app_id).unwrap_or(app_id);
-        
+
         // Cache the parsed Handle rather than recreating it on every frame
-        let handle: widget::icon::Handle = widget::icon::from_name(icon_name)
-            .symbolic(false)
-            .into();
-            
+        let handle: widget::icon::Handle =
+            widget::icon::from_name(icon_name).symbolic(false).into();
+
         self.icon_cache.insert(window.id, handle);
     }
 
