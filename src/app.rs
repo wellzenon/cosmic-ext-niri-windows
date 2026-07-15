@@ -3,17 +3,36 @@ use cosmic::iced::widget::Row;
 use cosmic::iced::{window::Id, Subscription, Task};
 use cosmic::prelude::*;
 use cosmic::widget;
+use cosmic::Application;
 use niri_ipc::{Action, Reply, Request, Response, Window, Workspace};
 use std::collections::HashMap;
 use std::time::Instant;
 
+#[derive(Debug, Clone)]
+pub struct WindowView {
+    pub id: u64,
+    pub is_focused: bool,
+    pub title: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkspaceView {
+    #[allow(dead_code)]
+    pub id: u64,
+    #[allow(dead_code)]
+    pub idx: u8,
+    pub windows: Vec<WindowView>,
+}
+
 pub struct AppModel {
     core: cosmic::Core,
-    windows: Vec<Window>,
-    workspaces: Vec<Workspace>,
+    raw_windows: HashMap<u64, Window>,
+    raw_workspaces: HashMap<u64, Workspace>,
+    display: Vec<WorkspaceView>,
     last_scroll_time: Instant,
     action_tx: Option<cosmic::iced::futures::channel::mpsc::Sender<niri_ipc::Action>>,
     icon_cache: HashMap<u64, widget::icon::Handle>,
+    last_focused_window: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,11 +74,13 @@ impl cosmic::Application for AppModel {
 
         let app = AppModel {
             core,
-            windows: Vec::new(),
-            workspaces: Vec::new(),
+            raw_windows: HashMap::new(),
+            raw_workspaces: HashMap::new(),
+            display: Vec::new(),
             last_scroll_time: Instant::now(),
             action_tx: Some(tx),
             icon_cache: HashMap::new(),
+            last_focused_window: None,
         };
 
         // Fetch initial list of windows and workspaces at startup
@@ -141,6 +162,7 @@ impl cosmic::Application for AppModel {
 
         let icon_f = icon_size as f32;
         let btn_padding = (icon_f * 0.15).max(1.0);
+        let btn_top_padding = btn_padding + (dot_height + dot_gap) / 2.0;
         let row_spacing = (icon_f * 0.20).max(1.0);
         let divider_block_padding = (icon_f * 0.30).max(3.0);
         let dot_width = (icon_f * 0.50).max(4.0);
@@ -152,124 +174,99 @@ impl cosmic::Application for AppModel {
             .spacing(row_spacing)
             .align_y(cosmic::iced::Alignment::Center);
 
-        let sorted = self.sorted_windows();
-        let current_output = &self.core.applet.output_name;
-
-        let display_wins: Vec<&Window> = sorted
-            .iter()
-            .filter(|w| w.app_id.as_deref() != Some(Self::APP_ID))
-            .filter(|w| {
-                if !current_output.is_empty() {
-                    if let Some(ws_id) = w.workspace_id {
-                        if let Some(ws) = self.workspaces.iter().find(|ws| ws.id == ws_id) {
-                            return ws.output.as_ref() == Some(current_output);
-                        }
-                    }
-                    false
-                } else {
-                    true // If we don't know the panel output, show all
-                }
-            })
-            .collect();
-
-        if display_wins.is_empty() {
+        if self.display.is_empty() || self.display.iter().all(|ws| ws.windows.is_empty()) {
             // Render a minimal 1px transparent space to satisfy Wayland geometry requirements
             // without showing any placeholder icon.
             row = row.push(cosmic::iced::widget::Space::new().width(1.0).height(1.0));
         } else {
-            let mut prev_workspace_id = None;
-            let mut is_first = true;
-
-            for window in display_wins {
-                if !is_first {
-                    if let (Some(prev_ws), Some(curr_ws)) = (prev_workspace_id, window.workspace_id)
-                    {
-                        if prev_ws != curr_ws {
-                            row = row.push(
-                                cosmic::widget::container(
-                                    cosmic::widget::divider::vertical::default(),
-                                )
-                                .padding([divider_block_padding as u16, btn_padding as u16]),
-                            );
-                        }
-                    }
+            let mut is_first_ws = true;
+            for workspace in &self.display {
+                if workspace.windows.is_empty() {
+                    continue;
                 }
-                prev_workspace_id = window.workspace_id;
-                is_first = false;
+                if !is_first_ws {
+                    row = row.push(
+                        cosmic::widget::container(cosmic::widget::divider::vertical::default())
+                            .padding([divider_block_padding as u16, btn_padding as u16]),
+                    );
+                }
+                is_first_ws = false;
 
-                // Grab icon handle from cache, or use fallback if not found yet (should be resolved by update)
-                let icon_handle = self.icon_cache.get(&window.id).cloned().unwrap_or_else(|| {
-                    widget::icon::from_name("preferences-system-windows-symbolic")
-                        .symbolic(false)
-                        .size(icon_size)
-                        .into()
-                });
+                for window in &workspace.windows {
+                    // Grab icon handle from cache, or use fallback if not found yet (should be resolved by update)
+                    let icon_handle =
+                        self.icon_cache.get(&window.id).cloned().unwrap_or_else(|| {
+                            widget::icon::from_name("preferences-system-windows-symbolic")
+                                .symbolic(false)
+                                .size(icon_size)
+                                .into()
+                        });
 
-                let icon_widget = widget::icon(icon_handle).size(icon_size);
+                    let icon_widget = widget::icon(icon_handle).size(icon_size);
 
-                let dot = if window.is_focused {
-                    cosmic::widget::container(
-                        cosmic::iced::widget::Space::new()
-                            .width(dot_width)
-                            .height(dot_height),
-                    )
-                    .class(cosmic::theme::Container::custom(move |t| {
-                        cosmic::widget::container::Style {
-                            background: Some(cosmic::iced::Background::Color(
-                                t.cosmic().accent_color().into(),
-                            )),
-                            border: cosmic::iced::Border {
-                                radius: dot_radius.into(),
+                    let dot = if window.is_focused {
+                        cosmic::widget::container(
+                            cosmic::iced::widget::Space::new()
+                                .width(dot_width)
+                                .height(dot_height),
+                        )
+                        .class(cosmic::theme::Container::custom(
+                            move |t| cosmic::widget::container::Style {
+                                background: Some(cosmic::iced::Background::Color(
+                                    t.cosmic().accent_color().into(),
+                                )),
+                                border: cosmic::iced::Border {
+                                    radius: dot_radius.into(),
+                                    ..Default::default()
+                                },
                                 ..Default::default()
                             },
-                            ..Default::default()
-                        }
-                    }))
-                } else {
-                    cosmic::widget::container(
-                        cosmic::iced::widget::Space::new()
-                            .width(dot_width)
-                            .height(dot_height),
-                    )
-                    .class(cosmic::theme::Container::custom(|_| {
-                        cosmic::widget::container::Style {
-                            background: None,
-                            border: cosmic::iced::Border {
-                                color: cosmic::iced::Color::TRANSPARENT,
-                                width: 0.0,
-                                radius: 0.0.into(),
-                            },
-                            ..Default::default()
-                        }
-                    }))
-                };
+                        ))
+                    } else {
+                        cosmic::widget::container(
+                            cosmic::iced::widget::Space::new()
+                                .width(dot_width)
+                                .height(dot_height),
+                        )
+                        .class(cosmic::theme::Container::custom(|_| {
+                            cosmic::widget::container::Style {
+                                background: None,
+                                border: cosmic::iced::Border {
+                                    color: cosmic::iced::Color::TRANSPARENT,
+                                    width: 0.0,
+                                    radius: 0.0.into(),
+                                },
+                                ..Default::default()
+                            }
+                        }))
+                    };
 
-                let content = cosmic::iced::widget::column![
-                    icon_widget,
-                    cosmic::iced::widget::Space::new().height(dot_gap),
-                    dot,
-                ]
-                .align_x(cosmic::iced::Alignment::Center);
+                    let content = cosmic::iced::widget::column![
+                        icon_widget,
+                        cosmic::iced::widget::Space::new().height(dot_gap),
+                        dot,
+                    ]
+                    .align_x(cosmic::iced::Alignment::Center);
 
-                let top_padding = btn_padding + (dot_height + dot_gap) / 2.0;
-                let padded_content = cosmic::widget::container(content).padding([
-                    top_padding,
-                    btn_padding,
-                    btn_padding,
-                    btn_padding,
-                ]);
+                    let padded_content = cosmic::widget::container(content).padding([
+                        btn_top_padding,
+                        btn_padding,
+                        btn_padding,
+                        btn_padding,
+                    ]);
 
-                let area = cosmic::iced::widget::mouse_area(padded_content)
-                    .on_press(Message::FocusWindow(window.id))
-                    .on_middle_press(Message::CloseWindow(window.id));
+                    let area = cosmic::iced::widget::mouse_area(padded_content)
+                        .on_press(Message::FocusWindow(window.id))
+                        .on_middle_press(Message::CloseWindow(window.id));
 
-                let title = window.title.clone().unwrap_or_else(|| "Window".to_string());
-                let tooltip =
-                    self.core
-                        .applet
-                        .applet_tooltip(area, title, false, Message::Surface, None);
+                    let title = window.title.clone();
+                    let tooltip =
+                        self.core
+                            .applet
+                            .applet_tooltip(area, title, false, Message::Surface, None);
 
-                row = row.push(tooltip);
+                    row = row.push(tooltip);
+                }
             }
         }
 
@@ -320,75 +317,175 @@ impl cosmic::Application for AppModel {
     fn update(&mut self, message: Self::Message) -> Task<cosmic::Action<Self::Message>> {
         match message {
             Message::InitialData { wins, wksps } => {
-                self.windows = wins;
-                self.workspaces = wksps;
-                let wins_clone = self.windows.clone();
-                for w in wins_clone {
-                    self.resolve_icon(&w);
+                let our_output = self.core.applet.output_name.clone();
+                self.raw_workspaces = wksps
+                    .into_iter()
+                    .filter(|ws| our_output.is_empty() || ws.output.as_deref() == Some(&our_output))
+                    .map(|ws| (ws.id, ws))
+                    .collect();
+
+                self.raw_windows = wins
+                    .into_iter()
+                    .filter(|w| {
+                        w.workspace_id
+                            .map_or(false, |ws_id| self.raw_workspaces.contains_key(&ws_id))
+                    })
+                    .map(|w| (w.id, w))
+                    .collect();
+
+                // Resolve icons
+                let icons_to_resolve: Vec<(u64, Option<String>)> = self
+                    .raw_windows
+                    .values()
+                    .map(|w| (w.id, w.app_id.clone()))
+                    .collect();
+                for (id, app_id) in icons_to_resolve {
+                    self.resolve_icon(id, app_id.as_deref());
                 }
+
+                // Find initial focus on our output
+                if let Some(w) = self.raw_windows.values().find(|w| w.is_focused) {
+                    self.last_focused_window = Some(w.id);
+                } else if let Some(w) = self.raw_windows.values().next() {
+                    self.last_focused_window = Some(w.id);
+                }
+
+                self.rebuild_display();
             }
             Message::NiriEvent(event) => match event {
                 Event::WorkspacesChanged { workspaces } => {
-                    self.workspaces = workspaces;
+                    let our_output = self.core.applet.output_name.clone();
+                    self.raw_workspaces = workspaces
+                        .into_iter()
+                        .filter(|ws| {
+                            our_output.is_empty() || ws.output.as_deref() == Some(&our_output)
+                        })
+                        .map(|ws| (ws.id, ws))
+                        .collect();
+
+                    // Retain only windows belonging to active workspaces on our output
+                    self.raw_windows.retain(|_, w| {
+                        w.workspace_id
+                            .map_or(false, |ws_id| self.raw_workspaces.contains_key(&ws_id))
+                    });
+
+                    self.rebuild_display();
                 }
                 Event::WorkspaceActivated { id, focused } => {
-                    if let Some(target) = self.workspaces.iter().find(|w| w.id == id).cloned() {
-                        let target_output = target.output;
-                        for ws in &mut self.workspaces {
-                            if ws.output == target_output {
-                                ws.is_active = ws.id == id;
-                                ws.is_focused = ws.id == id && focused;
+                    if let Some(ws) = self.raw_workspaces.get_mut(&id) {
+                        ws.is_active = true;
+                        ws.is_focused = focused;
+                        for other in self.raw_workspaces.values_mut() {
+                            if other.id != id {
+                                other.is_active = false;
+                                other.is_focused = false;
                             }
                         }
+                        self.rebuild_display();
                     }
                 }
                 Event::WindowsChanged { windows } => {
-                    self.windows = windows.clone();
-                    for w in windows {
-                        self.resolve_icon(&w);
+                    self.raw_windows = windows
+                        .into_iter()
+                        .filter(|w| {
+                            w.workspace_id
+                                .map_or(false, |ws_id| self.raw_workspaces.contains_key(&ws_id))
+                        })
+                        .map(|w| (w.id, w))
+                        .collect();
+
+                    self.icon_cache
+                        .retain(|id, _| self.raw_windows.contains_key(id));
+
+                    let icons_to_resolve: Vec<(u64, Option<String>)> = self
+                        .raw_windows
+                        .values()
+                        .map(|w| (w.id, w.app_id.clone()))
+                        .collect();
+                    for (id, app_id) in icons_to_resolve {
+                        self.resolve_icon(id, app_id.as_deref());
                     }
+
+                    if let Some(w) = self.raw_windows.values().find(|w| w.is_focused) {
+                        self.last_focused_window = Some(w.id);
+                    }
+                    self.rebuild_display();
                 }
                 Event::WindowOpenedOrChanged { window } => {
-                    if window.is_focused {
-                        for w in &mut self.windows {
-                            w.is_focused = false;
-                        }
-                    }
-                    self.resolve_icon(&window);
+                    let id = window.id;
+                    let is_focused = window.is_focused;
 
-                    if let Some(idx) = self.windows.iter().position(|w| w.id == window.id) {
-                        self.windows[idx] = window;
+                    if window
+                        .workspace_id
+                        .map_or(false, |ws_id| self.raw_workspaces.contains_key(&ws_id))
+                    {
+                        self.resolve_icon(id, window.app_id.as_deref());
+                        self.raw_windows.insert(id, window);
+                        if is_focused {
+                            self.last_focused_window = Some(id);
+                        }
+                        self.rebuild_display();
                     } else {
-                        self.windows.push(window);
+                        // If it moved to another output, remove it from our cache
+                        if self.raw_windows.remove(&id).is_some() {
+                            self.icon_cache.remove(&id);
+                            if self.last_focused_window == Some(id) {
+                                self.last_focused_window = None;
+                                if let Some(w) = self.raw_windows.values().find(|w| w.is_focused) {
+                                    self.last_focused_window = Some(w.id);
+                                } else if let Some(w) = self.raw_windows.values().next() {
+                                    self.last_focused_window = Some(w.id);
+                                }
+                            }
+                            self.rebuild_display();
+                        }
                     }
                 }
                 Event::WindowClosed { id } => {
-                    self.windows.retain(|w| w.id != id);
-                    self.icon_cache.remove(&id);
+                    if self.raw_windows.remove(&id).is_some() {
+                        self.icon_cache.remove(&id);
+                        if self.last_focused_window == Some(id) {
+                            self.last_focused_window = None;
+                            if let Some(w) = self.raw_windows.values().find(|w| w.is_focused) {
+                                self.last_focused_window = Some(w.id);
+                            } else if let Some(w) = self.raw_windows.values().next() {
+                                self.last_focused_window = Some(w.id);
+                            }
+                        }
+                        self.rebuild_display();
+                    }
                 }
                 Event::WindowFocusChanged { id } => {
-                    for w in &mut self.windows {
-                        w.is_focused = id == Some(w.id);
+                    if let Some(focused_id) = id {
+                        if self.raw_windows.contains_key(&focused_id) {
+                            self.last_focused_window = Some(focused_id);
+                            self.rebuild_display();
+                        }
                     }
                 }
                 Event::WindowUrgencyChanged { id, urgent } => {
-                    if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+                    if let Some(w) = self.raw_windows.get_mut(&id) {
                         w.is_urgent = urgent;
+                        self.rebuild_display();
                     }
                 }
                 Event::WindowLayoutsChanged { changes, .. } => {
+                    let mut changed = false;
                     for (id, new_layout) in changes {
-                        if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+                        if let Some(w) = self.raw_windows.get_mut(&id) {
                             w.layout = new_layout;
+                            changed = true;
                         }
+                    }
+                    if changed {
+                        self.rebuild_display();
                     }
                 }
                 _ => {}
             },
             Message::FocusWindow(window_id) => {
-                for w in &mut self.windows {
-                    w.is_focused = w.id == window_id;
-                }
+                self.last_focused_window = Some(window_id);
+                self.rebuild_display();
                 if let Some(tx) = &mut self.action_tx {
                     let _ = tx.try_send(Action::FocusWindow { id: window_id });
                 }
@@ -433,52 +530,61 @@ impl cosmic::Application for AppModel {
 }
 
 impl AppModel {
-    fn resolve_icon(&mut self, window: &Window) {
-        if self.icon_cache.contains_key(&window.id) {
+    fn rebuild_display(&mut self) {
+        let mut workspaces: Vec<&Workspace> = self.raw_workspaces.values().collect();
+        workspaces.sort_by_key(|ws| ws.idx);
+
+        let mut display = Vec::new();
+
+        for ws in workspaces {
+            let mut ws_windows: Vec<&Window> = self
+                .raw_windows
+                .values()
+                .filter(|w| w.workspace_id == Some(ws.id))
+                .filter(|w| w.app_id.as_deref() != Some(Self::APP_ID))
+                .collect();
+
+            ws_windows.sort_by_key(|w| {
+                w.layout
+                    .pos_in_scrolling_layout
+                    .unwrap_or((usize::MAX, usize::MAX))
+            });
+
+            let window_views: Vec<WindowView> = ws_windows
+                .into_iter()
+                .map(|w| {
+                    let is_focused = Some(w.id) == self.last_focused_window;
+                    let title = w.title.clone().unwrap_or_else(|| "Window".to_string());
+                    WindowView {
+                        id: w.id,
+                        is_focused,
+                        title,
+                    }
+                })
+                .collect();
+
+            display.push(WorkspaceView {
+                id: ws.id,
+                idx: ws.idx,
+                windows: window_views,
+            });
+        }
+
+        self.display = display;
+    }
+
+    fn resolve_icon(&mut self, id: u64, app_id: Option<&str>) {
+        if self.icon_cache.contains_key(&id) {
             return;
         }
-        let app_id = window
-            .app_id
-            .clone()
-            .unwrap_or_else(|| "preferences-system-windows-symbolic".to_string());
+        let app_id_str = app_id.unwrap_or("preferences-system-windows-symbolic");
 
-        let icon_name = crate::utils::find_fallback_icon(&app_id).unwrap_or(app_id);
+        let icon_name =
+            crate::utils::find_fallback_icon(app_id_str).unwrap_or_else(|| app_id_str.to_string());
 
-        // Cache the parsed Handle rather than recreating it on every frame
         let handle: widget::icon::Handle =
             widget::icon::from_name(icon_name).symbolic(false).into();
 
-        self.icon_cache.insert(window.id, handle);
-    }
-
-    fn sorted_windows(&self) -> Vec<Window> {
-        let mut sorted = self.windows.clone();
-        sorted.sort_by(|a, b| {
-            let ws_a = a
-                .workspace_id
-                .and_then(|id| self.workspaces.iter().find(|w| w.id == id));
-            let ws_b = b
-                .workspace_id
-                .and_then(|id| self.workspaces.iter().find(|w| w.id == id));
-
-            let idx_a = ws_a.map(|w| w.idx).unwrap_or(u8::MAX);
-            let idx_b = ws_b.map(|w| w.idx).unwrap_or(u8::MAX);
-
-            match idx_a.cmp(&idx_b) {
-                std::cmp::Ordering::Equal => {
-                    let pos_a = a
-                        .layout
-                        .pos_in_scrolling_layout
-                        .unwrap_or((usize::MAX, usize::MAX));
-                    let pos_b = b
-                        .layout
-                        .pos_in_scrolling_layout
-                        .unwrap_or((usize::MAX, usize::MAX));
-                    pos_a.cmp(&pos_b)
-                }
-                other => other,
-            }
-        });
-        sorted
+        self.icon_cache.insert(id, handle);
     }
 }
