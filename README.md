@@ -1,4 +1,4 @@
-# COSMIC Niri Windows Applet
+# ✨VIBECODED✨ COSMIC Niri Windows Applet
 
 `cosmic-ext-niri-windows` is a niri window list applet for the COSMIC Desktop panel (`cosmic-panel`). 
 
