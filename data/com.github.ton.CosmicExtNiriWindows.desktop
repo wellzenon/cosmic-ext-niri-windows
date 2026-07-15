@@ -1,0 +1,15 @@
+[Desktop Entry]
+Name=Niri Windows
+Exec=cosmic-ext-niri-windows
+Terminal=false
+Type=Application
+StartupNotify=true
+NotShowIn=COSMIC
+Icon=preferences-system-windows-symbolic
+Categories=COSMIC
+Keywords=Windows;Niri;Taskbar;
+X-CosmicApplet=true
+X-MinimizeApplet=5
+X-OverflowPriority=100
+X-OverflowMinSize=4
+X-HostWaylandDisplay=true
