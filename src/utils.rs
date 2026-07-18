@@ -7,6 +7,7 @@ pub fn find_fallback_icon(app_id: &str) -> Option<String> {
         PathBuf::from("/usr/share/applications"),
         PathBuf::from("/usr/local/share/applications"),
         dirs::data_dir().map(|d| d.join("applications")).unwrap_or_default(),
+        dirs::data_dir().map(|d| d.join("flatpak/exports/share/applications")).unwrap_or_default(),
         PathBuf::from("/var/lib/flatpak/exports/share/applications"),
     ];
 
@@ -34,9 +35,11 @@ pub fn find_fallback_icon(app_id: &str) -> Option<String> {
         
         // Then try fuzzy matching
         if let Ok(entries) = fs::read_dir(&dir) {
+            let app_id_lower = app_id.to_lowercase();
             for e in entries.flatten() {
                 if let Ok(file_name) = e.file_name().into_string() {
-                    if file_name.starts_with(app_id) && file_name.ends_with(".desktop") {
+                    let file_name_lower = file_name.to_lowercase();
+                    if file_name_lower.starts_with(&app_id_lower) && file_name_lower.ends_with(".desktop") {
                         let path = e.path();
                         if let Ok(entry) = DesktopEntry::from_path(&path, None::<&[&str]>) {
                             if let Some(icon) = entry.icon() {
