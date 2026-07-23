@@ -32,11 +32,17 @@ fn get_pinned_config_path() -> Option<std::path::PathBuf> {
 
 fn load_pinned() -> Vec<String> {
     if let Some(path) = get_pinned_config_path() {
-        eprintln!("[cosmic-ext-niri-windows] Loading pinned apps from path: {:?}", path);
+        eprintln!(
+            "[cosmic-ext-niri-windows] Loading pinned apps from path: {:?}",
+            path
+        );
         if path.exists() {
             if let Ok(content) = std::fs::read_to_string(&path) {
                 if let Ok(pinned) = serde_json::from_str::<Vec<String>>(&content) {
-                    eprintln!("[cosmic-ext-niri-windows] Loaded pinned apps successfully: {:?}", pinned);
+                    eprintln!(
+                        "[cosmic-ext-niri-windows] Loaded pinned apps successfully: {:?}",
+                        pinned
+                    );
                     return pinned;
                 }
             }
@@ -53,7 +59,10 @@ fn save_pinned_async(pinned: Vec<String>) -> Task<Message> {
     Task::perform(
         async move {
             if let Some(path) = get_pinned_config_path() {
-                eprintln!("[cosmic-ext-niri-windows] Saving pinned apps: {:?} to path: {:?}", pinned, path);
+                eprintln!(
+                    "[cosmic-ext-niri-windows] Saving pinned apps: {:?} to path: {:?}",
+                    pinned, path
+                );
                 if let Some(parent) = path.parent() {
                     let _ = tokio::fs::create_dir_all(parent).await;
                 }
@@ -62,16 +71,21 @@ fn save_pinned_async(pinned: Vec<String>) -> Task<Message> {
                         if let Err(e) = tokio::fs::write(&path, content).await {
                             eprintln!("[cosmic-ext-niri-windows] Failed to write pinned config file: {:?}", e);
                         } else {
-                            eprintln!("[cosmic-ext-niri-windows] Pinned config saved successfully.");
+                            eprintln!(
+                                "[cosmic-ext-niri-windows] Pinned config saved successfully."
+                            );
                         }
                     }
                     Err(e) => {
-                        eprintln!("[cosmic-ext-niri-windows] Failed to serialize pinned config: {:?}", e);
+                        eprintln!(
+                            "[cosmic-ext-niri-windows] Failed to serialize pinned config: {:?}",
+                            e
+                        );
                     }
                 }
             }
         },
-        |_| Message::Error("config saved".to_string())
+        |_| Message::Error("config saved".to_string()),
     )
 }
 
@@ -100,6 +114,9 @@ pub struct AppModel {
     hovered_pinned: Option<String>,
     context_menu_target: Option<MenuTarget>,
     ignore_next_applet_right_click: bool,
+    dragged_app: Option<(String, usize)>,
+    has_drag_moved: bool,
+    drag_x_start: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +144,14 @@ pub enum Message {
     UnpinApp(String),
     LaunchApp(String),
     HoverPinned(Option<String>),
+    DragStart {
+        app_id: String,
+        index: usize,
+    },
+    DragOver {
+        index: usize,
+    },
+    DragEnd,
 }
 
 impl cosmic::Application for AppModel {
@@ -168,6 +193,9 @@ impl cosmic::Application for AppModel {
             hovered_pinned: None,
             context_menu_target: None,
             ignore_next_applet_right_click: false,
+            dragged_app: None,
+            has_drag_moved: false,
+            drag_x_start: 0.0,
         };
 
         // Fetch initial list of windows and workspaces at startup
@@ -266,7 +294,16 @@ impl cosmic::Application for AppModel {
 
         let mut children = Vec::new();
 
-        if self.display.is_empty() || self.display.iter().all(|ws| ws.windows.is_empty()) {
+        let has_inactive_pinned = self.pinned.iter().any(|app_id| {
+            !self
+                .raw_windows
+                .values()
+                .any(|w| w.app_id.as_ref().map_or(false, |id| id == app_id))
+        });
+
+        if (self.display.is_empty() || self.display.iter().all(|ws| ws.windows.is_empty()))
+            && !has_inactive_pinned
+        {
             // Render a minimal 1px transparent space to satisfy Wayland geometry requirements
             // without showing any placeholder icon.
             children.push(
@@ -282,63 +319,55 @@ impl cosmic::Application for AppModel {
             let start_divider = match (self.show_workspace_name, is_horizontal) {
                 (true, true) => {
                     cosmic::widget::container(cosmic::widget::divider::vertical::default())
-                        .padding([
-                            divider_y_padding,
-                            0.0,
-                            divider_y_padding,
-                            divider_x_padding,
-                        ])
+                        .padding([divider_y_padding, 0.0, divider_y_padding, divider_x_padding])
                 }
-                (true, false) => cosmic::widget::container(
-                    cosmic::widget::divider::horizontal::default(),
+                (true, false) => {
+                    cosmic::widget::container(cosmic::widget::divider::horizontal::default())
+                        .padding([divider_x_padding, divider_y_padding, 0.0, divider_y_padding])
+                }
+                (false, true) => cosmic::widget::container(
+                    cosmic::widget::divider::vertical::default(),
                 )
                 .padding([
+                    divider_y_padding,
                     divider_x_padding,
                     divider_y_padding,
-                    0.0,
-                    divider_y_padding,
+                    divider_x_padding,
                 ]),
-                (false, true) => {
-                    cosmic::widget::container(cosmic::widget::divider::vertical::default())
+                (false, false) => {
+                    cosmic::widget::container(cosmic::widget::divider::horizontal::default())
                         .padding([
-                            divider_y_padding,
                             divider_x_padding,
                             divider_y_padding,
                             divider_x_padding,
+                            divider_y_padding,
                         ])
                 }
-                (false, false) => cosmic::widget::container(
-                    cosmic::widget::divider::horizontal::default(),
-                )
-                .padding([
-                    divider_x_padding,
-                    divider_y_padding,
-                    divider_x_padding,
-                    divider_y_padding,
-                ]),
             };
             children.push(start_divider.into());
 
             // Render Pinned Icons (closed apps only)
             let mut has_pinned = false;
-            for app_id in &self.pinned {
-                let is_open = self.raw_windows.values().any(|w| {
-                    w.app_id.as_ref().map_or(false, |id| id == app_id)
-                });
-                
+            for (idx, app_id) in self.pinned.iter().enumerate() {
+                let is_open = self
+                    .raw_windows
+                    .values()
+                    .any(|w| w.app_id.as_ref().map_or(false, |id| id == app_id));
+
                 if !is_open {
                     has_pinned = true;
-                    
-                    let icon_handle = self.app_icon_cache.get(app_id).cloned().unwrap_or_else(|| {
-                        widget::icon::from_name("preferences-system-windows-symbolic")
-                            .symbolic(false)
-                            .size(icon_size)
-                            .into()
-                    });
 
-                    // Dynamic hover opacity (0.4 base, 0.85 hovered)
+                    let icon_handle =
+                        self.app_icon_cache.get(app_id).cloned().unwrap_or_else(|| {
+                            widget::icon::from_name("preferences-system-windows-symbolic")
+                                .symbolic(false)
+                                .size(icon_size)
+                                .into()
+                        });
+
+                    // Dynamic hover opacity (0.25 base, 0.85 hovered)
                     let is_hovered = self.hovered_pinned.as_ref() == Some(app_id);
-                    let opacity = if is_hovered { 0.85 } else { 0.4 };
+                    let opacity: f32 = if is_hovered { 1.0 } else { 0.5 };
 
                     let icon_element: Element<'_, Self::Message> = match icon_handle.data.clone() {
                         cosmic::widget::icon::Data::Image(image_handle) => {
@@ -349,7 +378,7 @@ impl cosmic::Application for AppModel {
                                 .into()
                         }
                         cosmic::widget::icon::Data::Svg(svg_handle) => {
-                            cosmic::iced::widget::Svg::new(svg_handle)
+                            cosmic::iced::widget::Svg::<cosmic::Theme>::new(svg_handle)
                                 .width(cosmic::iced::Length::Fixed(icon_size as f32))
                                 .height(cosmic::iced::Length::Fixed(icon_size as f32))
                                 .opacity(opacity)
@@ -357,27 +386,71 @@ impl cosmic::Application for AppModel {
                         }
                     };
 
+                    let pinned_style = cosmic::theme::Button::Custom {
+                        active: Box::new(move |_focused, _theme| {
+                            cosmic::widget::button::Style::new()
+                        }),
+                        disabled: Box::new(move |_theme| cosmic::widget::button::Style::new()),
+                        hovered: Box::new(move |_focused, theme| {
+                            let cosmic = theme.cosmic();
+                            let mut style = cosmic::widget::button::Style::new();
+                            style.background =
+                                Some(cosmic::iced::Background::Color(cosmic::iced::Color {
+                                    a: 0.15,
+                                    ..cosmic.accent_color().into()
+                                }));
+                            style.border_radius = cosmic.corner_radii.radius_s.into();
+                            style
+                        }),
+                        pressed: Box::new(move |_focused, theme| {
+                            let cosmic = theme.cosmic();
+                            let mut style = cosmic::widget::button::Style::new();
+                            style.background =
+                                Some(cosmic::iced::Background::Color(cosmic::iced::Color {
+                                    a: 0.25,
+                                    ..cosmic.accent_color().into()
+                                }));
+                            style.border_radius = cosmic.corner_radii.radius_s.into();
+                            style
+                        }),
+                    };
+
                     let pinned_btn = widget::button::custom(icon_element)
                         .padding(btn_padding)
-                        .on_press(Message::LaunchApp(app_id.clone()))
-                        .class(cosmic::theme::Button::AppletIcon);
+                        .class(pinned_style);
 
-                    // Track hover and right click
+                    // mouse_area owns ALL events (press/release/enter/exit/right-click)
+                    // No on_press on button means no mouse capture, so on_enter works
+                    // across icons during drag for live reordering.
                     let app_id_clone1 = app_id.clone();
                     let app_id_clone2 = app_id.clone();
                     let track_area = cosmic::iced::widget::mouse_area(pinned_btn)
-                        .on_enter(Message::HoverPinned(Some(app_id_clone1)))
+                        .on_enter(Message::DragOver { index: idx })
                         .on_exit(Message::HoverPinned(None))
+                        .on_press(Message::DragStart {
+                            app_id: app_id_clone1,
+                            index: idx,
+                        })
+                        .on_release(Message::DragEnd)
                         .on_right_release(Message::RightClick(MenuTarget::Pinned {
                             app_id: app_id_clone2,
-                        }));
+                        }))
+                        .interaction(cosmic::iced::mouse::Interaction::Pointer);
 
                     // Use friendly Name from desktop file if cached, fallback to app_id
-                    let friendly_name = self.desktop_path_cache.get(app_id)
+                    let friendly_name = self
+                        .desktop_path_cache
+                        .get(app_id)
                         .and_then(|path| crate::utils::get_desktop_entry_name(path))
                         .unwrap_or_else(|| app_id.clone());
 
-                    let tooltip = self.core.applet.applet_tooltip(track_area, friendly_name, false, Message::Surface, None);
+                    let tooltip = self.core.applet.applet_tooltip(
+                        track_area,
+                        friendly_name,
+                        false,
+                        Message::Surface,
+                        None,
+                    );
                     children.push(tooltip.into());
                 }
             }
@@ -537,11 +610,51 @@ impl cosmic::Application for AppModel {
                         }
                     };
 
+                    let is_focused = window.is_focused;
+                    let active_btn_style = cosmic::theme::Button::Custom {
+                        active: Box::new(move |_focused, theme| {
+                            let cosmic = theme.cosmic();
+                            let mut style = cosmic::widget::button::Style::new();
+                            if is_focused {
+                                style.background =
+                                    Some(cosmic::iced::Background::Color(cosmic::iced::Color {
+                                        a: 0.18,
+                                        ..cosmic.accent_color().into()
+                                    }));
+                                style.border_radius = cosmic.corner_radii.radius_s.into();
+                            }
+                            style
+                        }),
+                        disabled: Box::new(|_theme| cosmic::widget::button::Style::new()),
+                        hovered: Box::new(move |_focused, theme| {
+                            let cosmic = theme.cosmic();
+                            let mut style = cosmic::widget::button::Style::new();
+                            let alpha = if is_focused { 0.28 } else { 0.15 };
+                            style.background =
+                                Some(cosmic::iced::Background::Color(cosmic::iced::Color {
+                                    a: alpha,
+                                    ..cosmic.accent_color().into()
+                                }));
+                            style.border_radius = cosmic.corner_radii.radius_s.into();
+                            style
+                        }),
+                        pressed: Box::new(move |_focused, theme| {
+                            let cosmic = theme.cosmic();
+                            let mut style = cosmic::widget::button::Style::new();
+                            style.background =
+                                Some(cosmic::iced::Background::Color(cosmic::iced::Color {
+                                    a: 0.32,
+                                    ..cosmic.accent_color().into()
+                                }));
+                            style.border_radius = cosmic.corner_radii.radius_s.into();
+                            style
+                        }),
+                    };
+
                     let btn = widget::button::custom(content)
                         .padding(padding)
                         .on_press(Message::FocusWindow(window.id))
-                        .class(cosmic::theme::Button::AppletIcon)
-                        .selected(window.is_focused);
+                        .class(active_btn_style);
 
                     let area = cosmic::iced::widget::mouse_area(btn)
                         .on_middle_press(Message::CloseWindow(window.id))
@@ -611,7 +724,7 @@ impl cosmic::Application for AppModel {
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
-        Subscription::run(|| {
+        let niri_sub = Subscription::run(|| {
             cosmic::iced::stream::channel(
                 100,
                 move |mut channel: cosmic::iced::futures::channel::mpsc::Sender<Message>| async move {
@@ -629,7 +742,20 @@ impl cosmic::Application for AppModel {
                     }
                 },
             )
-        })
+        });
+
+        let mouse_sub = cosmic::iced::event::listen_with(|event, _status, _window_id| {
+            if let cosmic::iced::Event::Mouse(cosmic::iced::mouse::Event::ButtonReleased(
+                cosmic::iced::mouse::Button::Left,
+            )) = event
+            {
+                Some(Message::DragEnd)
+            } else {
+                None
+            }
+        });
+
+        Subscription::batch(vec![niri_sub, mouse_sub])
     }
 
     fn update(&mut self, message: Self::Message) -> Task<cosmic::Action<Self::Message>> {
@@ -802,7 +928,9 @@ impl cosmic::Application for AppModel {
             Message::FocusWindow(window_id) => {
                 if self.last_focused_window == Some(window_id) {
                     if let Some(tx) = &mut self.action_tx {
-                        let _ = tx.try_send(Action::CenterWindow { id: Some(window_id) });
+                        let _ = tx.try_send(Action::CenterWindow {
+                            id: Some(window_id),
+                        });
                     }
                 } else {
                     self.last_focused_window = Some(window_id);
@@ -857,12 +985,17 @@ impl cosmic::Application for AppModel {
                 }
             }
             Message::RightClick(target) => {
-                eprintln!("[cosmic-ext-niri-windows] RightClick message received: {:?}", target);
+                eprintln!(
+                    "[cosmic-ext-niri-windows] RightClick message received: {:?}",
+                    target
+                );
                 match &target {
                     MenuTarget::Applet => {
                         if self.ignore_next_applet_right_click {
                             self.ignore_next_applet_right_click = false;
-                            eprintln!("[cosmic-ext-niri-windows] Ignored propagated Applet right click.");
+                            eprintln!(
+                                "[cosmic-ext-niri-windows] Ignored propagated Applet right click."
+                            );
                             return Task::none();
                         }
                     }
@@ -872,45 +1005,87 @@ impl cosmic::Application for AppModel {
                 }
 
                 if let Some(popup_id) = self.context_menu_id {
-                    eprintln!("[cosmic-ext-niri-windows] Closing existing popup: {:?}", popup_id);
+                    eprintln!(
+                        "[cosmic-ext-niri-windows] Closing existing popup: {:?}",
+                        popup_id
+                    );
                     self.context_menu_id = None;
                     self.context_menu_target = None;
                     return Task::done(cosmic::Action::Cosmic(cosmic::app::Action::Surface(
                         cosmic::surface::action::destroy_popup(popup_id),
                     )));
                 } else {
-                    eprintln!("[cosmic-ext-niri-windows] Opening context menu for target: {:?}", target);
+                    eprintln!(
+                        "[cosmic-ext-niri-windows] Opening context menu for target: {:?}",
+                        target
+                    );
                     self.context_menu_target = Some(target);
                     return self.open_context_menu();
                 }
             }
             Message::MouseMove(point) => {
                 self.last_mouse_pos = point;
+                if self.dragged_app.is_some() {
+                    if (point.x - self.drag_x_start).abs() > 6.0 {
+                        self.has_drag_moved = true;
+                    }
+                }
+            }
+            Message::DragStart { app_id, index } => {
+                self.dragged_app = Some((app_id, index));
+                self.drag_x_start = self.last_mouse_pos.x;
+                self.has_drag_moved = false;
+            }
+            Message::DragOver { index } => {
+                if let Some((dragged_app_id, dragged_idx)) = self.dragged_app.clone() {
+                    if dragged_idx != index && index < self.pinned.len() {
+                        self.pinned.remove(dragged_idx);
+                        self.pinned.insert(index, dragged_app_id.clone());
+                        self.dragged_app = Some((dragged_app_id.clone(), index));
+                        self.hovered_pinned = Some(dragged_app_id);
+                        self.rebuild_display();
+                    }
+                } else if index < self.pinned.len() {
+                    let hovered_id = self.pinned[index].clone();
+                    self.hovered_pinned = Some(hovered_id);
+                    self.rebuild_display();
+                }
+            }
+            Message::DragEnd => {
+                if let Some((app_id, _)) = self.dragged_app.take() {
+                    if !self.has_drag_moved {
+                        self.has_drag_moved = false;
+                        return self.update(Message::LaunchApp(app_id));
+                    } else {
+                        self.has_drag_moved = false;
+                        return save_pinned_async(self.pinned.clone()).map(cosmic::Action::from);
+                    }
+                }
+                self.has_drag_moved = false;
             }
             Message::PinApp(app_id) => {
                 if !self.pinned.contains(&app_id) {
                     self.pinned.push(app_id.clone());
                     let save_task = save_pinned_async(self.pinned.clone());
                     self.rebuild_display();
-                    
+
                     // Pre-cache path for the app if found
                     if let Some(path) = crate::utils::find_desktop_file_path(&app_id) {
                         self.desktop_path_cache.insert(app_id.clone(), path);
                     }
-                    
+
                     let pre_cache_icons = self.spawn_missing_icon_tasks();
-                    
-                    let mut tasks = vec![
-                        save_task.map(cosmic::Action::from),
-                        pre_cache_icons,
-                    ];
+
+                    let mut tasks = vec![save_task.map(cosmic::Action::from), pre_cache_icons];
 
                     if let Some(popup_id) = self.context_menu_id {
                         self.context_menu_id = None;
                         self.context_menu_target = None;
-                        tasks.push(Task::done(cosmic::Action::Cosmic(cosmic::app::Action::Surface(
-                            cosmic::surface::action::destroy_popup(popup_id),
-                        ))));
+                        tasks.push(Task::done(cosmic::Action::Cosmic(
+                            cosmic::app::Action::Surface(cosmic::surface::action::destroy_popup(
+                                popup_id,
+                            )),
+                        )));
                     }
 
                     return Task::batch(tasks);
@@ -921,15 +1096,17 @@ impl cosmic::Application for AppModel {
                     self.pinned.remove(pos);
                     let save_task = save_pinned_async(self.pinned.clone());
                     self.rebuild_display();
-                    
+
                     let mut tasks = vec![save_task.map(cosmic::Action::from)];
 
                     if let Some(popup_id) = self.context_menu_id {
                         self.context_menu_id = None;
                         self.context_menu_target = None;
-                        tasks.push(Task::done(cosmic::Action::Cosmic(cosmic::app::Action::Surface(
-                            cosmic::surface::action::destroy_popup(popup_id),
-                        ))));
+                        tasks.push(Task::done(cosmic::Action::Cosmic(
+                            cosmic::app::Action::Surface(cosmic::surface::action::destroy_popup(
+                                popup_id,
+                            )),
+                        )));
                     }
 
                     return Task::batch(tasks);
@@ -947,7 +1124,11 @@ impl cosmic::Application for AppModel {
                 };
 
                 let cmd = if let Some(path) = path_opt {
-                    vec!["gio".to_string(), "launch".to_string(), path.to_string_lossy().into_owned()]
+                    vec![
+                        "gio".to_string(),
+                        "launch".to_string(),
+                        path.to_string_lossy().into_owned(),
+                    ]
                 } else {
                     vec![app_id]
                 };
@@ -1044,7 +1225,7 @@ impl AppModel {
     fn spawn_missing_icon_tasks(&mut self) -> Task<cosmic::Action<Message>> {
         let mut tasks = Vec::new();
         let mut ids_to_resolve = std::collections::HashSet::new();
-        
+
         for w in self.raw_windows.values() {
             let app_id_str = w
                 .app_id
@@ -1053,7 +1234,7 @@ impl AppModel {
                 .to_string();
             ids_to_resolve.insert(app_id_str);
         }
-        
+
         for app_id in &self.pinned {
             ids_to_resolve.insert(app_id.clone());
         }
@@ -1084,8 +1265,11 @@ impl AppModel {
             |_app| cosmic::surface::action::LiveSettings::default(),
             move |app| {
                 let parent = app.core.main_window_id().unwrap_or(Id::RESERVED);
-                let mut settings = app.core.applet.get_popup_settings(parent, popup_id, None, None, None);
-                
+                let mut settings = app
+                    .core
+                    .applet
+                    .get_popup_settings(parent, popup_id, None, None, None);
+
                 // Override the anchor_rect to be a 1x1 rect at the last known mouse cursor position
                 settings.positioner.anchor_rect = cosmic::iced::Rectangle {
                     x: app.last_mouse_pos.x as i32,
@@ -1134,7 +1318,8 @@ impl AppModel {
                             content_col = content_col.push(pin_toggler);
                         }
 
-                        content_col = content_col.push(cosmic::widget::divider::horizontal::default());
+                        content_col =
+                            content_col.push(cosmic::widget::divider::horizontal::default());
                     }
                     Some(MenuTarget::Pinned { app_id }) => {
                         // 2. Pin window (Pin Application)
@@ -1146,7 +1331,8 @@ impl AppModel {
                             .on_toggle(move |_| Message::UnpinApp(app_id_clone.clone()));
 
                         content_col = content_col.push(pin_toggler);
-                        content_col = content_col.push(cosmic::widget::divider::horizontal::default());
+                        content_col =
+                            content_col.push(cosmic::widget::divider::horizontal::default());
                     }
                     _ => {}
                 }
