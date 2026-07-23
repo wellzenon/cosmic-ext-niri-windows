@@ -13,6 +13,7 @@ pub struct WindowView {
     pub id: u64,
     pub is_focused: bool,
     pub title: String,
+    pub app_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -21,6 +22,7 @@ pub struct WorkspaceView {
     pub id: u64,
     #[allow(dead_code)]
     pub idx: u8,
+    pub name: Option<String>,
     pub windows: Vec<WindowView>,
 }
 
@@ -31,8 +33,12 @@ pub struct AppModel {
     display: Vec<WorkspaceView>,
     last_scroll_time: Instant,
     action_tx: Option<cosmic::iced::futures::channel::mpsc::Sender<niri_ipc::Action>>,
-    icon_cache: HashMap<u64, widget::icon::Handle>,
+    app_icon_cache: HashMap<String, widget::icon::Handle>,
+    resolving_icons: std::collections::HashSet<String>,
     last_focused_window: Option<u64>,
+    show_workspace_name: bool,
+    context_menu_id: Option<Id>,
+    last_mouse_pos: cosmic::iced::Point,
 }
 
 #[derive(Debug, Clone)]
@@ -44,7 +50,7 @@ pub enum Message {
         wksps: Vec<Workspace>,
     },
     IconResolved {
-        id: u64,
+        app_id: String,
         handle: widget::icon::Handle,
     },
     FocusWindow(u64),
@@ -53,6 +59,9 @@ pub enum Message {
     WorkspaceScrollUp,
     Surface(cosmic::surface::Action),
     Error(String),
+    ToggleShowWorkspaceName(bool),
+    RightClick,
+    MouseMove(cosmic::iced::Point),
 }
 
 impl cosmic::Application for AppModel {
@@ -83,8 +92,12 @@ impl cosmic::Application for AppModel {
             display: Vec::new(),
             last_scroll_time: Instant::now(),
             action_tx: Some(tx),
-            icon_cache: HashMap::new(),
+            app_icon_cache: HashMap::new(),
+            resolving_icons: std::collections::HashSet::new(),
             last_focused_window: None,
+            show_workspace_name: false,
+            context_menu_id: None,
+            last_mouse_pos: cosmic::iced::Point::default(),
         };
 
         // Fetch initial list of windows and workspaces at startup
@@ -168,9 +181,11 @@ impl cosmic::Application for AppModel {
         let anchor = self.core.applet.anchor;
 
         let icon_f = icon_size as f32;
-        let btn_padding = (icon_f * 0.15).max(1.0);
-        let row_spacing = (icon_f * 0.20).max(1.0);
-        let divider_block_padding = (icon_f * 0.30).max(3.0);
+        let btn_padding = (icon_f * 0.03).max(1.0);
+        let spacing = (icon_f * 0.05).max(1.0);
+        let divider_y_padding = (icon_f * 0.30).max(3.0);
+        let divider_x_padding = (icon_f * 0.20).max(3.0);
+        let wksp_label_size = icon_f * 0.40;
         let dot_width = (icon_f * 0.50).max(4.0);
         let dot_height = (icon_f * 0.10).max(2.0);
         let dot_radius = dot_height / 2.0;
@@ -191,30 +206,99 @@ impl cosmic::Application for AppModel {
                     .into(),
             );
         } else {
+            let mut is_first_ws = true;
             for workspace in &self.display {
                 if workspace.windows.is_empty() {
                     continue;
                 }
 
-                let divider = if is_horizontal {
-                    cosmic::widget::container(cosmic::widget::divider::vertical::default())
-                        .padding([divider_block_padding as u16, btn_padding as u16])
-                } else {
-                    cosmic::widget::container(cosmic::widget::divider::horizontal::default())
-                        .padding([btn_padding as u16, divider_block_padding as u16])
-                };
+                if is_first_ws {
+                    let start_divider = match (self.show_workspace_name, is_horizontal) {
+                        (true, true) => {
+                            cosmic::widget::container(cosmic::widget::divider::vertical::default())
+                                .padding([
+                                    divider_y_padding,
+                                    0.0,
+                                    divider_y_padding,
+                                    divider_x_padding,
+                                ])
+                        }
+                        (true, false) => cosmic::widget::container(
+                            cosmic::widget::divider::horizontal::default(),
+                        )
+                        .padding([
+                            divider_x_padding,
+                            divider_y_padding,
+                            0.0,
+                            divider_y_padding,
+                        ]),
+                        (false, true) => {
+                            cosmic::widget::container(cosmic::widget::divider::vertical::default())
+                                .padding([
+                                    divider_y_padding,
+                                    divider_x_padding,
+                                    divider_y_padding,
+                                    divider_x_padding,
+                                ])
+                        }
+                        (false, false) => cosmic::widget::container(
+                            cosmic::widget::divider::horizontal::default(),
+                        )
+                        .padding([
+                            divider_x_padding,
+                            divider_y_padding,
+                            divider_x_padding,
+                            divider_y_padding,
+                        ]),
+                    };
 
-                children.push(divider.into());
+                    children.push(start_divider.into());
+                    is_first_ws = false;
+                } else if !self.show_workspace_name {
+                    let mid_divider = if is_horizontal {
+                        cosmic::widget::container(cosmic::widget::divider::vertical::default())
+                            .padding([divider_y_padding as u16, divider_x_padding as u16])
+                    } else {
+                        cosmic::widget::container(cosmic::widget::divider::horizontal::default())
+                            .padding([divider_x_padding as u16, divider_y_padding as u16])
+                    };
+                    children.push(mid_divider.into());
+                }
+
+                if self.show_workspace_name {
+                    let label = workspace
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| workspace.idx.to_string());
+                    let label_widget = cosmic::iced::widget::text(label).size(wksp_label_size);
+
+                    let label_padding = if is_horizontal {
+                        [0.0, divider_x_padding, 0.0, divider_x_padding]
+                    } else {
+                        [divider_x_padding, 0.0, divider_x_padding, 0.0]
+                    };
+
+                    let label_container =
+                        cosmic::widget::container(label_widget).padding(label_padding);
+
+                    children.push(label_container.into());
+                }
 
                 for window in &workspace.windows {
-                    // Grab icon handle from cache, or use fallback if not found yet (should be resolved by update)
+                    let app_id_str = window
+                        .app_id
+                        .as_deref()
+                        .unwrap_or("preferences-system-windows-symbolic");
                     let icon_handle =
-                        self.icon_cache.get(&window.id).cloned().unwrap_or_else(|| {
-                            widget::icon::from_name("preferences-system-windows-symbolic")
-                                .symbolic(false)
-                                .size(icon_size)
-                                .into()
-                        });
+                        self.app_icon_cache
+                            .get(app_id_str)
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                widget::icon::from_name("preferences-system-windows-symbolic")
+                                    .symbolic(false)
+                                    .size(icon_size)
+                                    .into()
+                            });
 
                     let icon_widget = widget::icon(icon_handle).size(icon_size);
 
@@ -319,10 +403,13 @@ impl cosmic::Application for AppModel {
                         }
                     };
 
-                    let padded_content = cosmic::widget::container(content).padding(padding);
-
-                    let area = cosmic::iced::widget::mouse_area(padded_content)
+                    let btn = widget::button::custom(content)
+                        .padding(padding)
                         .on_press(Message::FocusWindow(window.id))
+                        .class(cosmic::theme::Button::AppletIcon)
+                        .selected(window.is_focused);
+
+                    let area = cosmic::iced::widget::mouse_area(btn)
                         .on_middle_press(Message::CloseWindow(window.id));
 
                     let title = window.title.clone();
@@ -335,35 +422,37 @@ impl cosmic::Application for AppModel {
                 }
             }
 
-            let last_divider = if is_horizontal {
-                cosmic::widget::container(cosmic::widget::divider::vertical::default())
-                    .padding([divider_block_padding as u16, btn_padding as u16])
-            } else {
-                cosmic::widget::container(cosmic::widget::divider::horizontal::default())
-                    .padding([btn_padding as u16, divider_block_padding as u16])
-            };
+            if !is_first_ws {
+                let last_divider = if is_horizontal {
+                    cosmic::widget::container(cosmic::widget::divider::vertical::default())
+                        .padding([divider_y_padding as u16, divider_x_padding as u16])
+                } else {
+                    cosmic::widget::container(cosmic::widget::divider::horizontal::default())
+                        .padding([divider_x_padding as u16, divider_y_padding as u16])
+                };
 
-            children.push(last_divider.into());
+                children.push(last_divider.into());
+            }
         }
 
         let applet_content: Element<'_, Self::Message> = if is_horizontal {
             Row::with_children(children)
-                .spacing(row_spacing)
+                .spacing(spacing)
                 .align_y(cosmic::iced::Alignment::Center)
                 .width(cosmic::iced::Length::Shrink)
                 .height(cosmic::iced::Length::Shrink)
                 .into()
         } else {
             Column::with_children(children)
-                .spacing(row_spacing)
+                .spacing(spacing)
                 .align_x(cosmic::iced::Alignment::Center)
                 .width(cosmic::iced::Length::Shrink)
                 .height(cosmic::iced::Length::Shrink)
                 .into()
         };
 
-        let applet_area =
-            cosmic::iced::widget::mouse_area(applet_content).on_scroll(|delta| match delta {
+        let applet_area = cosmic::iced::widget::mouse_area(applet_content)
+            .on_scroll(|delta| match delta {
                 cosmic::iced::mouse::ScrollDelta::Lines { y, .. }
                 | cosmic::iced::mouse::ScrollDelta::Pixels { y, .. } => {
                     if y < 0.0 {
@@ -372,7 +461,9 @@ impl cosmic::Application for AppModel {
                         Message::WorkspaceScrollUp
                     }
                 }
-            });
+            })
+            .on_right_release(Message::RightClick)
+            .on_move(|point| Message::MouseMove(point));
 
         self.core.applet.autosize_window(applet_area).into()
     }
@@ -422,22 +513,6 @@ impl cosmic::Application for AppModel {
                     .map(|w| (w.id, w))
                     .collect();
 
-                // Resolve icons assincronamente
-                let icons_to_resolve: Vec<(u64, Option<String>)> = self
-                    .raw_windows
-                    .values()
-                    .map(|w| (w.id, w.app_id.clone()))
-                    .collect();
-                let mut tasks = Vec::new();
-                for (id, app_id) in icons_to_resolve {
-                    if !self.icon_cache.contains_key(&id) {
-                        tasks.push(
-                            self.resolve_icon_async(id, app_id)
-                                .map(cosmic::Action::from),
-                        );
-                    }
-                }
-
                 // Find initial focus on our output
                 if let Some(w) = self.raw_windows.values().find(|w| w.is_focused) {
                     self.last_focused_window = Some(w.id);
@@ -447,12 +522,11 @@ impl cosmic::Application for AppModel {
 
                 self.rebuild_display();
 
-                if !tasks.is_empty() {
-                    return Task::batch(tasks);
-                }
+                return self.spawn_missing_icon_tasks();
             }
-            Message::IconResolved { id, handle } => {
-                self.icon_cache.insert(id, handle);
+            Message::IconResolved { app_id, handle } => {
+                self.resolving_icons.remove(&app_id);
+                self.app_icon_cache.insert(app_id, handle);
                 self.rebuild_display();
             }
             Message::NiriEvent(event) => {
@@ -472,10 +546,6 @@ impl cosmic::Application for AppModel {
                             w.workspace_id
                                 .map_or(false, |ws_id| self.raw_workspaces.contains_key(&ws_id))
                         });
-
-                        // Limpa cache de ícones não mais ativos para evitar leak de memória
-                        self.icon_cache
-                            .retain(|id, _| self.raw_windows.contains_key(id));
 
                         self.rebuild_display();
                         Task::none()
@@ -504,34 +574,12 @@ impl cosmic::Application for AppModel {
                             .map(|w| (w.id, w))
                             .collect();
 
-                        self.icon_cache
-                            .retain(|id, _| self.raw_windows.contains_key(id));
-
-                        let icons_to_resolve: Vec<(u64, Option<String>)> = self
-                            .raw_windows
-                            .values()
-                            .map(|w| (w.id, w.app_id.clone()))
-                            .collect();
-                        let mut tasks = Vec::new();
-                        for (id, app_id) in icons_to_resolve {
-                            if !self.icon_cache.contains_key(&id) {
-                                tasks.push(
-                                    self.resolve_icon_async(id, app_id)
-                                        .map(cosmic::Action::from),
-                                );
-                            }
-                        }
-
                         if let Some(w) = self.raw_windows.values().find(|w| w.is_focused) {
                             self.last_focused_window = Some(w.id);
                         }
                         self.rebuild_display();
 
-                        if tasks.is_empty() {
-                            Task::none()
-                        } else {
-                            Task::batch(tasks)
-                        }
+                        self.spawn_missing_icon_tasks()
                     }
                     Event::WindowOpenedOrChanged { window } => {
                         let id = window.id;
@@ -541,22 +589,15 @@ impl cosmic::Application for AppModel {
                             .workspace_id
                             .map_or(false, |ws_id| self.raw_workspaces.contains_key(&ws_id))
                         {
-                            let task = if !self.icon_cache.contains_key(&id) {
-                                self.resolve_icon_async(id, window.app_id.clone())
-                                    .map(cosmic::Action::from)
-                            } else {
-                                Task::none()
-                            };
                             self.raw_windows.insert(id, window);
                             if is_focused {
                                 self.last_focused_window = Some(id);
                             }
                             self.rebuild_display();
-                            task
+                            self.spawn_missing_icon_tasks()
                         } else {
                             // If it moved to another output, remove it from our cache
                             if self.raw_windows.remove(&id).is_some() {
-                                self.icon_cache.remove(&id);
                                 if self.last_focused_window == Some(id) {
                                     self.last_focused_window = None;
                                     if let Some(w) =
@@ -574,7 +615,6 @@ impl cosmic::Application for AppModel {
                     }
                     Event::WindowClosed { id } => {
                         if self.raw_windows.remove(&id).is_some() {
-                            self.icon_cache.remove(&id);
                             if self.last_focused_window == Some(id) {
                                 self.last_focused_window = None;
                                 if let Some(w) = self.raw_windows.values().find(|w| w.is_focused) {
@@ -621,10 +661,16 @@ impl cosmic::Application for AppModel {
                 return task;
             }
             Message::FocusWindow(window_id) => {
-                self.last_focused_window = Some(window_id);
-                self.rebuild_display();
-                if let Some(tx) = &mut self.action_tx {
-                    let _ = tx.try_send(Action::FocusWindow { id: window_id });
+                if self.last_focused_window == Some(window_id) {
+                    if let Some(tx) = &mut self.action_tx {
+                        let _ = tx.try_send(Action::CenterWindow { id: Some(window_id) });
+                    }
+                } else {
+                    self.last_focused_window = Some(window_id);
+                    self.rebuild_display();
+                    if let Some(tx) = &mut self.action_tx {
+                        let _ = tx.try_send(Action::FocusWindow { id: window_id });
+                    }
                 }
             }
             Message::CloseWindow(window_id) => {
@@ -653,9 +699,42 @@ impl cosmic::Application for AppModel {
             Message::Surface(action) => {
                 return Task::done(cosmic::Action::Cosmic(cosmic::app::Action::Surface(action)));
             }
-            Message::PopupClosed(_) => {}
+            Message::PopupClosed(id) => {
+                if Some(id) == self.context_menu_id {
+                    self.context_menu_id = None;
+                }
+            }
             Message::Error(err) => {
                 eprintln!("COSMIC Niri Applet Error: {}", err);
+            }
+            Message::ToggleShowWorkspaceName(val) => {
+                self.show_workspace_name = val;
+                self.rebuild_display();
+                if let Some(popup_id) = self.context_menu_id {
+                    self.context_menu_id = None;
+                    return Task::done(cosmic::Action::Cosmic(cosmic::app::Action::Surface(
+                        cosmic::surface::action::destroy_popup(popup_id),
+                    )));
+                }
+            }
+            Message::RightClick => {
+                eprintln!("[cosmic-ext-niri-windows] RightClick message received!");
+                if let Some(popup_id) = self.context_menu_id {
+                    eprintln!(
+                        "[cosmic-ext-niri-windows] Closing existing popup: {:?}",
+                        popup_id
+                    );
+                    self.context_menu_id = None;
+                    return Task::done(cosmic::Action::Cosmic(cosmic::app::Action::Surface(
+                        cosmic::surface::action::destroy_popup(popup_id),
+                    )));
+                } else {
+                    eprintln!("[cosmic-ext-niri-windows] Opening context menu...");
+                    return self.open_context_menu();
+                }
+            }
+            Message::MouseMove(point) => {
+                self.last_mouse_pos = point;
             }
         }
         Task::none()
@@ -696,6 +775,7 @@ impl AppModel {
                         id: w.id,
                         is_focused,
                         title,
+                        app_id: w.app_id.clone(),
                     }
                 })
                 .collect();
@@ -703,6 +783,7 @@ impl AppModel {
             display.push(WorkspaceView {
                 id: ws.id,
                 idx: ws.idx,
+                name: ws.name.clone(),
                 windows: window_views,
             });
         }
@@ -710,15 +791,11 @@ impl AppModel {
         self.display = display;
     }
 
-    fn resolve_icon_async(&self, id: u64, app_id: Option<String>) -> Task<Message> {
+    fn resolve_icon_async(&self, app_id_str: String) -> Task<Message> {
         Task::perform(
             async move {
-                let app_id_str = app_id
-                    .as_deref()
-                    .unwrap_or("preferences-system-windows-symbolic");
-
-                let icon_name = crate::utils::find_fallback_icon(app_id_str)
-                    .unwrap_or_else(|| app_id_str.to_string());
+                let icon_name = crate::utils::find_fallback_icon(&app_id_str)
+                    .unwrap_or_else(|| app_id_str.clone());
 
                 let icon_name_clean = if icon_name.starts_with("file://") {
                     icon_name.trim_start_matches("file://").to_string()
@@ -736,9 +813,70 @@ impl AppModel {
                         .into()
                 };
 
-                (id, handle)
+                (app_id_str, handle)
             },
-            |(id, handle)| Message::IconResolved { id, handle },
+            |(app_id, handle)| Message::IconResolved { app_id, handle },
         )
+    }
+
+    fn spawn_missing_icon_tasks(&mut self) -> Task<cosmic::Action<Message>> {
+        let mut tasks = Vec::new();
+        for w in self.raw_windows.values() {
+            let app_id_str = w
+                .app_id
+                .as_deref()
+                .unwrap_or("preferences-system-windows-symbolic")
+                .to_string();
+            if !self.app_icon_cache.contains_key(&app_id_str)
+                && !self.resolving_icons.contains(&app_id_str)
+            {
+                self.resolving_icons.insert(app_id_str.clone());
+                tasks.push(
+                    self.resolve_icon_async(app_id_str)
+                        .map(cosmic::Action::from),
+                );
+            }
+        }
+        if tasks.is_empty() {
+            Task::none()
+        } else {
+            Task::batch(tasks)
+        }
+    }
+
+    fn open_context_menu(&mut self) -> Task<cosmic::Action<Message>> {
+        let popup_id = Id::unique();
+        self.context_menu_id = Some(popup_id);
+
+        let action = cosmic::surface::action::app_popup(
+            |_app| cosmic::surface::action::LiveSettings::default(),
+            move |app| {
+                let parent = app.core.main_window_id().unwrap_or(Id::RESERVED);
+                let mut settings = app.core.applet.get_popup_settings(parent, popup_id, None, None, None);
+                
+                // Override the anchor_rect to be a 1x1 rect at the last known mouse cursor position
+                settings.positioner.anchor_rect = cosmic::iced::Rectangle {
+                    x: app.last_mouse_pos.x as i32,
+                    y: app.last_mouse_pos.y as i32,
+                    width: 1,
+                    height: 1,
+                };
+
+                settings
+            },
+            Some(Box::new(move |app: &AppModel| {
+                let checkbox = widget::checkbox(app.show_workspace_name)
+                    .label("Show workspace name")
+                    .on_toggle(|val| Message::ToggleShowWorkspaceName(val));
+
+                // Add 16px padding around the checkbox for clean popup margins
+                let padded = cosmic::widget::container(checkbox).padding(16);
+                let popup_content = app.core.applet.popup_container(padded);
+
+                Element::from(popup_content).map(cosmic::Action::App)
+            })),
+        );
+
+        Task::done(cosmic::Action::Cosmic(cosmic::app::Action::Surface(action)))
     }
 }
