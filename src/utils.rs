@@ -214,3 +214,88 @@ pub fn find_fallback_icon(app_id: &str) -> Option<String> {
     // Otherwise, return None so the caller falls back to app_id as the icon name
     None
 }
+
+/// Searches desktop files to retrieve the absolute path for a given app_id.
+pub fn find_desktop_file_path(app_id: &str) -> Option<std::path::PathBuf> {
+    let dirs = vec![
+        std::path::PathBuf::from("/usr/share/applications"),
+        std::path::PathBuf::from("/usr/local/share/applications"),
+        dirs::data_dir().map(|d| d.join("applications")).unwrap_or_default(),
+        dirs::data_dir().map(|d| d.join("flatpak/exports/share/applications")).unwrap_or_default(),
+        std::path::PathBuf::from("/var/lib/flatpak/exports/share/applications"),
+    ];
+
+    let mut search_names = vec![
+        format!("{}.desktop", app_id),
+        format!("{}.desktop", app_id.to_lowercase()),
+    ];
+
+    if app_id.contains('.') {
+        if let Some(last_part) = app_id.split('.').last() {
+            search_names.push(format!("{}.desktop", last_part));
+            search_names.push(format!("{}.desktop", last_part.to_lowercase()));
+        }
+    }
+
+    for dir in &dirs {
+        if !dir.exists() {
+            continue;
+        }
+
+        // Try exact match first
+        for name in &search_names {
+            let path = dir.join(name);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+
+        // Try fuzzy match
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            let app_id_lower = app_id.to_lowercase();
+            for e in entries.flatten() {
+                if let Ok(file_name) = e.file_name().into_string() {
+                    let file_name_lower = file_name.to_lowercase();
+                    if (file_name_lower.starts_with(&app_id_lower)
+                        || file_name_lower.ends_with(&format!(".{}.desktop", app_id_lower)))
+                        && file_name_lower.ends_with(".desktop")
+                    {
+                        return Some(e.path());
+                    }
+                }
+            }
+        }
+
+        // Try StartupWMClass match
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            let app_id_lower = app_id.to_lowercase();
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.extension().map_or(false, |ext| ext == "desktop") {
+                    if let Ok(entry) = DesktopEntry::from_path(&path, None::<&[&str]>) {
+                        if let Some(group) = entry.groups.group("Desktop Entry") {
+                            if let Some(wm_class) = group.0.get("StartupWMClass") {
+                                if wm_class.0.to_lowercase() == app_id_lower {
+                                    return Some(path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Reads the Name field from a desktop entry file.
+pub fn get_desktop_entry_name(path: &std::path::Path) -> Option<String> {
+    if let Ok(entry) = DesktopEntry::from_path(path, None::<&[&str]>) {
+        if let Some(group) = entry.groups.group("Desktop Entry") {
+            if let Some(name_tuple) = group.0.get("Name") {
+                return Some(name_tuple.0.clone());
+            }
+        }
+    }
+    None
+}
