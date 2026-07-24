@@ -1,5 +1,7 @@
 # ✨VIBECODED✨ COSMIC Niri Windows Applet
 
+https://github.com/user-attachments/assets/ed827859-49ab-4df1-8ba4-ebcc8baf6d0c
+
 `cosmic-ext-niri-windows` is a niri window list applet for the COSMIC Desktop panel (`cosmic-panel`). 
 
 - **Monitor Output Filtering**: shows only per monitor windows, but all workspaces from that monitor.
