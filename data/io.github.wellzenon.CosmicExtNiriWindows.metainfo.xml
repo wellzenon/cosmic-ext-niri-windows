@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.wellzenon.CosmicExtNiriWindows</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>COSMIC Niri Windows Applet</name>
+  <summary>Window list applet for Niri on COSMIC Desktop</summary>
+  <description>
+    <p>
+      An applet for the COSMIC Desktop panel (cosmic-panel) that displays and manages window lists for the Niri compositor.
+    </p>
+    <ul>
+      <li>Monitor Output Filtering: shows per-monitor windows.</li>
+      <li>Mouse Interactions: Left click to focus, middle click to close, scroll to change workspaces.</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.wellzenon.CosmicExtNiriWindows.desktop</launchable>
+  <provides>
+    <id>io.github.wellzenon.CosmicExtNiriWindows.desktop</id>
+  </provides>
+  <icon type="stock">io.github.wellzenon.CosmicExtNiriWindows</icon>
+  <categories>
+    <category>COSMIC</category>
+    <category>Utility</category>
+  </categories>
+  <developer_name>wellzenon</developer_name>
+  <url type="homepage">https://github.com/wellzenon/cosmic-ext-niri-windows</url>
+  <url type="bugtracker">https://github.com/wellzenon/cosmic-ext-niri-windows/issues</url>
+  <content_rating type="oars-1.1"/>
+</component>

@@ -228,7 +228,7 @@ impl cosmic::Application for AppModel {
     type Flags = ();
     type Message = Message;
 
-    const APP_ID: &'static str = "com.github.ton.CosmicExtNiriWindows";
+    const APP_ID: &'static str = "io.github.wellzenon.CosmicExtNiriWindows";
 
     fn core(&self) -> &cosmic::Core {
         &self.core

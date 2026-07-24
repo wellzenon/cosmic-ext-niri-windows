@@ -1,0 +1,30 @@
+app-id: io.github.wellzenon.CosmicExtNiriWindows
+runtime: org.freedesktop.Platform
+runtime-version: '23.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: cosmic-ext-niri-windows
+finish-args:
+  - --socket=wayland
+  - --filesystem=xdg-run/niri:ro
+  - --device=dri
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/cosmic-ext-niri-windows/cargo-home
+
+modules:
+  - name: cosmic-ext-niri-windows
+    buildsystem: simple
+    build-commands:
+      - cargo build --release --locked
+      - install -Dm755 target/release/cosmic-ext-niri-windows /app/bin/cosmic-ext-niri-windows
+      - install -Dm644 data/io.github.wellzenon.CosmicExtNiriWindows.desktop /app/share/applications/io.github.wellzenon.CosmicExtNiriWindows.desktop
+      - install -Dm644 data/io.github.wellzenon.CosmicExtNiriWindows.metainfo.xml /app/share/metainfo/io.github.wellzenon.CosmicExtNiriWindows.metainfo.xml
+      - install -Dm644 data/io.github.wellzenon.CosmicExtNiriWindows.svg /app/share/icons/hicolor/scalable/apps/io.github.wellzenon.CosmicExtNiriWindows.svg
+    sources:
+      - type: git
+        url: https://github.com/wellzenon/cosmic-ext-niri-windows.git
+        tag: v0.1.0
