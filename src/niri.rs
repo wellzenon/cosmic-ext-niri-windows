@@ -13,34 +13,28 @@ impl Connection {
         let socket_path = if let Some(path) = std::env::var_os(SOCKET_PATH_ENV) {
             std::path::PathBuf::from(path)
         } else {
-            // Fallback: Scan XDG_RUNTIME_DIR for active niri.wayland-*.sock sockets
+            // Fallback: Scan XDG_RUNTIME_DIR for most recently modified niri.wayland-*.sock socket
             let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::NotFound,
                     "Neither NIRI_SOCKET nor XDG_RUNTIME_DIR are set",
                 )
             })?;
-            let read_dir = std::fs::read_dir(runtime_dir)?;
-            let mut candidates = Vec::new();
-            for entry in read_dir {
-                if let Ok(entry) = entry {
+
+            std::fs::read_dir(runtime_dir)?
+                .flatten()
+                .filter_map(|entry| {
                     let path = entry.path();
-                    if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
-                        if filename.starts_with("niri.wayland-") && filename.ends_with(".sock") {
-                            if let Ok(metadata) = entry.metadata() {
-                                if let Ok(modified) = metadata.modified() {
-                                    candidates.push((path, modified));
-                                }
-                            }
-                        }
+                    let filename = path.file_name()?.to_str()?;
+                    if filename.starts_with("niri.wayland-") && filename.ends_with(".sock") {
+                        let modified = entry.metadata().ok()?.modified().ok()?;
+                        Some((path, modified))
+                    } else {
+                        None
                     }
-                }
-            }
-            candidates.sort_by(|a, b| b.1.cmp(&a.1));
-            candidates
-                .into_iter()
-                .next()
-                .map(|c| c.0)
+                })
+                .max_by_key(|(_, modified)| *modified)
+                .map(|(path, _)| path)
                 .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::NotFound,
@@ -53,16 +47,14 @@ impl Connection {
     }
 
     pub async fn to_listener(mut self) -> io::Result<Listener> {
-        self.push_request(niri_ipc::Request::EventStream)
-            .await?
-            .expect("Failed to open event stream");
-
+        let _ = self.push_request(niri_ipc::Request::EventStream).await?;
         let reader = BufReader::new(self.0);
         Ok(Listener(reader))
     }
 
     pub async fn push_request(&mut self, req: niri_ipc::Request) -> io::Result<Reply> {
-        let mut buf = serde_json::to_string(&req).unwrap();
+        let mut buf = serde_json::to_string(&req)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         buf.push('\n');
         self.0.write_all(buf.as_bytes()).await?;
 
@@ -70,7 +62,8 @@ impl Connection {
         let mut reader = BufReader::new(&mut self.0);
         reader.read_line(&mut buf).await?;
 
-        Ok(serde_json::from_str(buf.as_str()).unwrap())
+        serde_json::from_str(buf.as_str())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 }
 
