@@ -9,6 +9,11 @@ fn get_application_dirs() -> Vec<PathBuf> {
         PathBuf::from("/usr/local/share/applications"),
     ];
 
+    if let Some(home_dir) = dirs::home_dir() {
+        dirs.push(home_dir.join(".local/share/applications"));
+        dirs.push(home_dir.join(".local/share/flatpak/exports/share/applications"));
+    }
+
     if let Some(d) = dirs::data_dir() {
         dirs.push(d.join("applications"));
         dirs.push(d.join("flatpak/exports/share/applications"));
@@ -30,11 +35,12 @@ pub fn resolve_icon_name_to_path(icon_name: &str) -> Option<String> {
 
     // Standard search directories for icons
     let mut search_dirs = Vec::new();
+    if let Some(home_dir) = dirs::home_dir() {
+        search_dirs.push(home_dir.join(".local/share/icons"));
+        search_dirs.push(home_dir.join(".icons"));
+    }
     if let Some(data_dir) = dirs::data_dir() {
         search_dirs.push(data_dir.join("icons"));
-    }
-    if let Some(home_dir) = dirs::home_dir() {
-        search_dirs.push(home_dir.join(".icons"));
     }
     search_dirs.push(PathBuf::from("/usr/share/icons"));
     search_dirs.push(PathBuf::from("/usr/share/pixmaps"));

@@ -11,7 +11,7 @@
     </p>
     <ul>
       <li>Monitor Output Filtering: shows per-monitor windows.</li>
-      <li>Mouse Interactions: Left click to focus, middle click to close, scroll to change workspaces.</li>
+      <li>Mouse Interactions: Left click to focus/center, middle click to close, scroll to change workspaces.</li>
     </ul>
   </description>
   <launchable type="desktop-id">io.github.wellzenon.CosmicExtNiriWindows.desktop</launchable>
@@ -23,8 +23,20 @@
     <category>COSMIC</category>
     <category>Utility</category>
   </categories>
-  <developer_name>wellzenon</developer_name>
+  <developer id="io.github.wellzenon">
+    <name>wellzenon</name>
+  </developer>
   <url type="homepage">https://github.com/wellzenon/cosmic-ext-niri-windows</url>
   <url type="bugtracker">https://github.com/wellzenon/cosmic-ext-niri-windows/issues</url>
+  <releases>
+    <release version="0.1.0" date="2026-07-24">
+      <description>
+        <p>Initial release of COSMIC Niri Windows applet with workspace window grouping, PWA launcher support, and Niri IPC integration.</p>
+      </description>
+    </release>
+  </releases>
+  <branding>
+    <color type="primary" scheme_preference="dark">#1a1b26</color>
+  </branding>
   <content_rating type="oars-1.1"/>
 </component>

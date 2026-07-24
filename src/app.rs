@@ -6,7 +6,12 @@ use cosmic::widget;
 use cosmic::Application;
 use niri_ipc::{Action, Reply, Request, Response, Window, Workspace};
 use std::collections::HashMap;
-use std::time::Instant;
+use tokio::time::Instant;
+#[cfg(target_os = "linux")]
+#[allow(unused_imports)]
+use iced_winit::platform_specific::commands::layer_surface::{
+    set_keyboard_interactivity, KeyboardInteractivity,
+};
 
 #[derive(Debug, Clone)]
 pub struct WindowView {
@@ -111,6 +116,7 @@ pub struct AppModel {
     dragged_item: Option<DraggedItem>,
     has_drag_moved: bool,
     drag_x_start: f32,
+    focused_before_drag: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -126,6 +132,7 @@ pub enum Message {
         app_id: String,
         handle: widget::icon::Handle,
     },
+    #[allow(dead_code)]
     FocusWindow(u64),
     CloseWindow(u64),
     WorkspaceScrollDown,
@@ -155,7 +162,6 @@ pub enum Message {
         target_workspace_id: u64,
         target: DragTarget,
     },
-    WindowDragEnd,
 }
 
 /// Helper function to create custom button style for applet icons with specified alpha opacity.
@@ -265,6 +271,7 @@ impl cosmic::Application for AppModel {
             dragged_item: None,
             has_drag_moved: false,
             drag_x_start: 0.0,
+            focused_before_drag: false,
         };
 
         // Fetch initial list of windows and workspaces at startup
@@ -317,11 +324,16 @@ impl cosmic::Application for AppModel {
             |_| Message::Error("IPC Writer Task Died".to_string()),
         );
 
+        let main_window_id = cosmic::iced::window::Id::RESERVED;
+        let no_keyboard_task = set_keyboard_interactivity::<Message>(main_window_id, KeyboardInteractivity::None)
+            .map(cosmic::Action::from);
+
         (
             app,
             Task::batch(vec![
                 fetch_task.map(cosmic::Action::from),
                 writer_task.map(cosmic::Action::from),
+                no_keyboard_task,
             ]),
         )
     }
@@ -624,7 +636,7 @@ impl cosmic::Application for AppModel {
                             target: DragTarget::Window(window.id),
                         })
                         .on_exit(Message::Hover(None))
-                        .on_release(Message::WindowDragEnd)
+                        .on_release(Message::DragEnd)
                         .on_middle_press(Message::CloseWindow(window.id))
                         .on_right_release(Message::RightClick(MenuTarget::Window {
                             id: window.id,
@@ -702,8 +714,10 @@ impl cosmic::Application for AppModel {
                         if let Ok(conn) = Connection::make_connection().await {
                             if let Ok(mut listener) = conn.to_listener().await {
                                 let mut buf = String::new();
-                                while let Ok(Some(event)) = listener.next_event(&mut buf).await {
-                                    let _ = channel.try_send(Message::NiriEvent(event));
+                                while let Ok(maybe_event) = listener.next_event(&mut buf).await {
+                                    if let Some(event) = maybe_event {
+                                        let _ = channel.try_send(Message::NiriEvent(event));
+                                    }
                                     buf.clear();
                                 }
                             }
@@ -991,10 +1005,21 @@ impl cosmic::Application for AppModel {
                                     .map(cosmic::Action::from);
                             }
                         }
-                        DraggedItem::Window { window_id, .. } => {
+                        DraggedItem::Window { window_id, workspace_id } => {
                             if !self.has_drag_moved {
                                 self.has_drag_moved = false;
-                                return self.update(Message::FocusWindow(window_id));
+                                self.send_action(Action::FocusWorkspace {
+                                    reference: niri_ipc::WorkspaceReferenceArg::Id(workspace_id),
+                                });
+                                self.send_action(Action::FocusWindow { id: window_id });
+                                if self.focused_before_drag {
+                                    self.send_action(Action::CenterWindow {
+                                        id: Some(window_id),
+                                    });
+                                } else {
+                                    self.last_focused_window = Some(window_id);
+                                    self.rebuild_display();
+                                }
                             }
                         }
                     }
@@ -1011,6 +1036,8 @@ impl cosmic::Application for AppModel {
                 });
                 self.drag_x_start = self.last_mouse_pos.x;
                 self.has_drag_moved = false;
+                self.focused_before_drag = self.last_focused_window == Some(window_id);
+                self.last_focused_window = Some(window_id);
                 self.send_action(Action::FocusWindow { id: window_id });
             }
             Message::WindowDragOver {
@@ -1091,9 +1118,6 @@ impl cosmic::Application for AppModel {
                     }
                 }
             }
-            Message::WindowDragEnd => {
-                return self.update(Message::DragEnd);
-            }
             Message::PinApp(app_id) => {
                 if !self.pinned.contains(&app_id) {
                     self.pinned.push(app_id.clone());
@@ -1151,13 +1175,33 @@ impl cosmic::Application for AppModel {
                 };
 
                 let cmd = if let Some(path) = path_opt {
-                    vec![
-                        "gio".to_string(),
-                        "launch".to_string(),
-                        path.to_string_lossy().into_owned(),
-                    ]
+                    let mut shell_cmd = None;
+                    if let Ok(entry) = freedesktop_desktop_entry::DesktopEntry::from_path(&path, None::<&[&str]>) {
+                        if let Some(exec) = entry.exec() {
+                            let cleaned_exec = exec
+                                .split_whitespace()
+                                .filter(|arg| !arg.starts_with('%'))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            if !cleaned_exec.is_empty() {
+                                shell_cmd = Some(vec!["sh".to_string(), "-c".to_string(), cleaned_exec]);
+                            }
+                        }
+                    }
+                    let path_str = path.to_string_lossy();
+                    shell_cmd.unwrap_or_else(|| {
+                        vec![
+                            "sh".to_string(),
+                            "-c".to_string(),
+                            format!("gtk-launch '{app_id}' 2>/dev/null || gio launch '{path_str}' 2>/dev/null || exec '{path_str}'"),
+                        ]
+                    })
                 } else {
-                    vec![app_id]
+                    vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        format!("gtk-launch '{app_id}' 2>/dev/null || exec '{app_id}'"),
+                    ]
                 };
                 self.send_action(Action::Spawn { command: cmd });
             }
@@ -1189,9 +1233,9 @@ impl AppModel {
 
     fn rebuild_display(&mut self) {
         let mut workspaces: Vec<&Workspace> = self.raw_workspaces.values().collect();
-        workspaces.sort_by_key(|ws| ws.idx);
+        workspaces.sort_unstable_by_key(|ws| ws.idx);
 
-        let mut display = Vec::new();
+        self.display.clear();
 
         for ws in workspaces {
             let mut ws_windows: Vec<&Window> = self
@@ -1201,7 +1245,7 @@ impl AppModel {
                 .filter(|w| w.app_id.as_deref() != Some(Self::APP_ID))
                 .collect();
 
-            ws_windows.sort_by_key(|w| {
+            ws_windows.sort_unstable_by_key(|w| {
                 w.layout
                     .pos_in_scrolling_layout
                     .unwrap_or((usize::MAX, usize::MAX))
@@ -1221,15 +1265,13 @@ impl AppModel {
                 })
                 .collect();
 
-            display.push(WorkspaceView {
+            self.display.push(WorkspaceView {
                 id: ws.id,
                 idx: ws.idx,
                 name: ws.name.clone(),
                 windows: window_views,
             });
         }
-
-        self.display = display;
     }
 
     fn resolve_icon_async(&self, app_id_str: String) -> Task<Message> {

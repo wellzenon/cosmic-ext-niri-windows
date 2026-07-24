@@ -10,18 +10,40 @@ pub struct Connection(UnixStream);
 
 impl Connection {
     pub async fn make_connection() -> io::Result<Connection> {
-        let socket_path = if let Some(path) = std::env::var_os(SOCKET_PATH_ENV) {
-            std::path::PathBuf::from(path)
-        } else {
-            // Fallback: Scan XDG_RUNTIME_DIR for most recently modified niri.wayland-*.sock socket
-            let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "Neither NIRI_SOCKET nor XDG_RUNTIME_DIR are set",
-                )
-            })?;
+        // 1. Try NIRI_SOCKET env var (set by Niri compositor and propagated into Flatpak)
+        if let Some(path) = std::env::var_os(SOCKET_PATH_ENV) {
+            let path_buf = std::path::PathBuf::from(&path);
+            match UnixStream::connect(&path_buf).await {
+                Ok(s) => return Ok(Self(s)),
+                Err(e) => {
+                    eprintln!(
+                        "COSMIC Niri: NIRI_SOCKET={} exists but connection failed: {}",
+                        path_buf.display(),
+                        e
+                    );
+                }
+            }
+        }
 
-            std::fs::read_dir(runtime_dir)?
+        // 2. Scan XDG_RUNTIME_DIR for niri.wayland-*.sock
+        let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                // Fallback: determine UID from /proc/self/status or default to 1000
+                let uid = std::fs::read_to_string("/proc/self/status")
+                    .ok()
+                    .and_then(|s| {
+                        s.lines()
+                            .find(|l| l.starts_with("Uid:"))
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .and_then(|u| u.parse::<u32>().ok())
+                    })
+                    .unwrap_or(1000);
+                std::path::PathBuf::from(format!("/run/user/{}", uid))
+            });
+
+        if let Ok(entries) = std::fs::read_dir(&runtime_dir) {
+            let mut candidates: Vec<_> = entries
                 .flatten()
                 .filter_map(|entry| {
                     let path = entry.path();
@@ -33,17 +55,33 @@ impl Connection {
                         None
                     }
                 })
-                .max_by_key(|(_, modified)| *modified)
-                .map(|(path, _)| path)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "Could not find any active niri.wayland-*.sock socket in XDG_RUNTIME_DIR",
-                    )
-                })?
-        };
-        let s = UnixStream::connect(socket_path).await?;
-        Ok(Self(s))
+                .collect();
+
+            // Sort by most recently modified first
+            candidates.sort_by(|a, b| b.1.cmp(&a.1));
+
+            for (path, _) in &candidates {
+                match UnixStream::connect(path).await {
+                    Ok(s) => return Ok(Self(s)),
+                    Err(e) => {
+                        eprintln!(
+                            "COSMIC Niri: Found socket {} but connection failed: {}",
+                            path.display(),
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "Could not connect to any Niri IPC socket. NIRI_SOCKET={:?}, XDG_RUNTIME_DIR={}",
+                std::env::var_os(SOCKET_PATH_ENV),
+                runtime_dir.display()
+            ),
+        ))
     }
 
     pub async fn to_listener(mut self) -> io::Result<Listener> {
@@ -74,8 +112,8 @@ impl Listener {
         self.0.read_line(buf).await?;
         match serde_json::from_str(buf) {
             Ok(e) => Ok(Some(e)),
-            Err(err) => {
-                eprintln!("COSMIC Niri: Failed to deserialize event: {err}. Raw: {buf}");
+            Err(_) => {
+                // Silently ignore new or unhandled Niri IPC event variants (e.g., CastsChanged)
                 Ok(None)
             }
         }

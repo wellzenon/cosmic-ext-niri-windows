@@ -1,30 +1,53 @@
 app-id: io.github.wellzenon.CosmicExtNiriWindows
 runtime: org.freedesktop.Platform
-runtime-version: '23.08'
+runtime-version: "25.08"
 sdk: org.freedesktop.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
-command: cosmic-ext-niri-windows
+command: cosmic-ext-niri-windows-wrapper.sh
+
 finish-args:
+  # Display & Session sockets
   - --socket=wayland
-  - --filesystem=xdg-run/niri:ro
+  - --socket=session-bus
   - --device=dri
+  # Dynamic Niri IPC socket access (/run/user/$UID/niri.wayland-*.sock)
+  - --filesystem=/run/user:rw
+  # Application & Icon access for taskbar icons
+  - --filesystem=xdg-data/applications:ro
+  - --filesystem=xdg-data/icons:ro
+  - --filesystem=~/.local/share/applications:ro
+  - --filesystem=~/.local/share/icons:ro
+  - --filesystem=~/.icons:ro
+  # COSMIC Theme & Host OS access
+  - --filesystem=xdg-config/cosmic:ro
+  - --filesystem=~/.config/cosmic:ro
+  - --filesystem=host-os:ro
+  # COSMIC & Freedesktop DBus services
+  - --talk-name=com.system76.CosmicTheme
+  - --talk-name=com.system76.CosmicTk
+  - --talk-name=com.system76.CosmicSettings
+  - --talk-name=org.freedesktop.portal.Desktop
+  - --talk-name=org.freedesktop.portal.OpenURI
 
 build-options:
+  build-args:
+    - --share=network
   append-path: /usr/lib/sdk/rust-stable/bin
   env:
-    CARGO_HOME: /run/build/cosmic-ext-niri-windows/cargo-home
+    CARGO_HOME: /tmp/cargo-home
+    CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 modules:
   - name: cosmic-ext-niri-windows
     buildsystem: simple
     build-commands:
-      - cargo build --release --locked
+      - cargo build --release
       - install -Dm755 target/release/cosmic-ext-niri-windows /app/bin/cosmic-ext-niri-windows
+      - install -Dm755 data/cosmic-ext-niri-windows-wrapper.sh /app/bin/cosmic-ext-niri-windows-wrapper.sh
       - install -Dm644 data/io.github.wellzenon.CosmicExtNiriWindows.desktop /app/share/applications/io.github.wellzenon.CosmicExtNiriWindows.desktop
       - install -Dm644 data/io.github.wellzenon.CosmicExtNiriWindows.metainfo.xml /app/share/metainfo/io.github.wellzenon.CosmicExtNiriWindows.metainfo.xml
       - install -Dm644 data/io.github.wellzenon.CosmicExtNiriWindows.svg /app/share/icons/hicolor/scalable/apps/io.github.wellzenon.CosmicExtNiriWindows.svg
     sources:
-      - type: git
-        url: https://github.com/wellzenon/cosmic-ext-niri-windows.git
-        tag: v0.1.0
+      - type: dir
+        path: .

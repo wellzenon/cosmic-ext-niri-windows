@@ -31,11 +31,11 @@ add-to-panel:
         echo "Added to panel center. Restart cosmic-panel to apply."
     fi
 
-# restart cosmic-panel to reload applets
+# restart cosmic-panel to reload applets (prevents duplicate bar instances)
 restart-panel:
     pkill -x cosmic-panel || true
-    sleep 0.5
-    cosmic-panel &
+    @sleep 0.8
+    @pgrep -x cosmic-panel >/dev/null || (cosmic-panel &)
 
 # check the applet
 check:
