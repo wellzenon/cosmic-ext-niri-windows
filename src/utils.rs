@@ -228,3 +228,72 @@ pub fn get_desktop_entry_name(path: &Path) -> Option<String> {
     }
     None
 }
+
+#[derive(Debug, Clone)]
+pub struct ColumnPreset {
+    pub label: String,
+    pub change_spec: String,
+}
+
+/// Dynamically parses preset-column-widths from ~/.config/niri/config.kdl
+pub fn load_niri_column_presets() -> Vec<ColumnPreset> {
+    let mut presets = Vec::new();
+
+    if let Some(config_dir) = dirs::config_dir() {
+        let niri_config = config_dir.join("niri").join("config.kdl");
+        if let Ok(content) = fs::read_to_string(&niri_config) {
+            let mut in_preset_block = false;
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("preset-column-widths") {
+                    in_preset_block = true;
+                    continue;
+                }
+                if in_preset_block {
+                    if trimmed == "}" {
+                        break;
+                    }
+                    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        if parts[0] == "proportion" {
+                            if let Ok(val) = parts[1].parse::<f64>() {
+                                let pct = (val * 100.0).round() as u32;
+                                presets.push(ColumnPreset {
+                                    label: format!("{pct}%"),
+                                    change_spec: format!("{pct}%"),
+                                });
+                            }
+                        } else if parts[0] == "fixed" {
+                            if let Ok(val) = parts[1].parse::<i32>() {
+                                presets.push(ColumnPreset {
+                                    label: format!("{val}px"),
+                                    change_spec: format!("{val}"),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if presets.is_empty() {
+        // Fallback default presets if config.kdl does not specify preset-column-widths
+        vec![
+            ColumnPreset {
+                label: "33%".to_string(),
+                change_spec: "33%".to_string(),
+            },
+            ColumnPreset {
+                label: "50%".to_string(),
+                change_spec: "50%".to_string(),
+            },
+            ColumnPreset {
+                label: "66%".to_string(),
+                change_spec: "66%".to_string(),
+            },
+        ]
+    } else {
+        presets
+    }
+}

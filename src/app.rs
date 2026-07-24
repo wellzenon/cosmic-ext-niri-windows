@@ -117,6 +117,7 @@ pub struct AppModel {
     has_drag_moved: bool,
     drag_x_start: f32,
     focused_before_drag: bool,
+    column_presets: Vec<crate::utils::ColumnPreset>,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +136,8 @@ pub enum Message {
     #[allow(dead_code)]
     FocusWindow(u64),
     CloseWindow(u64),
+    SetColumnWidth(u64, String),
+    MaximizeColumn(u64),
     WorkspaceScrollDown,
     WorkspaceScrollUp,
     Surface(cosmic::surface::Action),
@@ -272,6 +275,7 @@ impl cosmic::Application for AppModel {
             has_drag_moved: false,
             drag_x_start: 0.0,
             focused_before_drag: false,
+            column_presets: crate::utils::load_niri_column_presets(),
         };
 
         // Fetch initial list of windows and workspaces at startup
@@ -892,20 +896,38 @@ impl cosmic::Application for AppModel {
                 return task;
             }
             Message::FocusWindow(window_id) => {
-                if self.last_focused_window == Some(window_id) {
-                    self.send_action(Action::CenterWindow {
-                        id: Some(window_id),
-                    });
-                } else {
-                    self.last_focused_window = Some(window_id);
-                    self.rebuild_display();
-                    self.send_action(Action::FocusWindow { id: window_id });
-                }
+                let ws_id = self.raw_windows.get(&window_id).and_then(|w| w.workspace_id).unwrap_or(0);
+                let is_already_focused = self.last_focused_window == Some(window_id);
+                self.focus_or_center_window(window_id, ws_id, is_already_focused);
             }
             Message::CloseWindow(window_id) => {
                 self.send_action(Action::CloseWindow {
                     id: Some(window_id),
                 });
+            }
+            Message::SetColumnWidth(window_id, change_spec) => {
+                let ws_id = self.raw_windows.get(&window_id).and_then(|w| w.workspace_id).unwrap_or(0);
+                self.focus_or_center_window(window_id, ws_id, false);
+                self.send_action(Action::Spawn {
+                    command: vec![
+                        "niri".to_string(),
+                        "msg".to_string(),
+                        "action".to_string(),
+                        "set-column-width".to_string(),
+                        change_spec,
+                    ],
+                });
+                if let Some(task) = self.close_popup() {
+                    return task;
+                }
+            }
+            Message::MaximizeColumn(window_id) => {
+                let ws_id = self.raw_windows.get(&window_id).and_then(|w| w.workspace_id).unwrap_or(0);
+                self.focus_or_center_window(window_id, ws_id, false);
+                self.send_action(Action::MaximizeColumn {});
+                if let Some(task) = self.close_popup() {
+                    return task;
+                }
             }
             Message::WorkspaceScrollDown => {
                 if self.last_scroll_time.elapsed() >= std::time::Duration::from_millis(200) {
@@ -1008,18 +1030,7 @@ impl cosmic::Application for AppModel {
                         DraggedItem::Window { window_id, workspace_id } => {
                             if !self.has_drag_moved {
                                 self.has_drag_moved = false;
-                                self.send_action(Action::FocusWorkspace {
-                                    reference: niri_ipc::WorkspaceReferenceArg::Id(workspace_id),
-                                });
-                                self.send_action(Action::FocusWindow { id: window_id });
-                                if self.focused_before_drag {
-                                    self.send_action(Action::CenterWindow {
-                                        id: Some(window_id),
-                                    });
-                                } else {
-                                    self.last_focused_window = Some(window_id);
-                                    self.rebuild_display();
-                                }
+                                self.focus_or_center_window(window_id, workspace_id, self.focused_before_drag);
                             }
                         }
                     }
@@ -1037,8 +1048,6 @@ impl cosmic::Application for AppModel {
                 self.drag_x_start = self.last_mouse_pos.x;
                 self.has_drag_moved = false;
                 self.focused_before_drag = self.last_focused_window == Some(window_id);
-                self.last_focused_window = Some(window_id);
-                self.send_action(Action::FocusWindow { id: window_id });
             }
             Message::WindowDragOver {
                 target_workspace_id,
@@ -1377,7 +1386,36 @@ impl AppModel {
                             .width(cosmic::iced::Length::Fill);
                         content_col = content_col.push(close_btn);
 
-                        // 2. Pin window (Pin Application)
+                        content_col =
+                            content_col.push(cosmic::widget::divider::horizontal::default());
+
+                        // 2. Column Width Controls (dynamically parsed from niri config.kdl + 100% Maximize)
+                        let width_label = cosmic::iced::widget::text("Column Width").size(13);
+                        content_col = content_col.push(width_label);
+
+                        let mut width_row = Row::new().spacing(4);
+                        let window_id = *id;
+
+                        for preset in &app.column_presets {
+                            let change_spec = preset.change_spec.clone();
+                            let btn = widget::button::custom(cosmic::iced::widget::text(preset.label.clone()).size(12))
+                                .on_press(Message::SetColumnWidth(window_id, change_spec))
+                                .padding([4, 8]);
+                            width_row = width_row.push(btn);
+                        }
+
+                        // Always append 100% Maximize button at the end
+                        let max_btn = widget::button::custom(cosmic::iced::widget::text("100%").size(12))
+                            .on_press(Message::MaximizeColumn(window_id))
+                            .padding([4, 8]);
+                        width_row = width_row.push(max_btn);
+
+                        content_col = content_col.push(width_row);
+
+                        content_col =
+                            content_col.push(cosmic::widget::divider::horizontal::default());
+
+                        // 3. Pin window (Pin Application)
                         if let Some(app_id) = app_id {
                             let is_pinned = app.pinned.contains(app_id);
                             let app_id_clone = app_id.clone();
@@ -1394,10 +1432,10 @@ impl AppModel {
                                 .on_toggle(move |_| pin_action.clone());
 
                             content_col = content_col.push(pin_toggler);
-                        }
 
-                        content_col =
-                            content_col.push(cosmic::widget::divider::horizontal::default());
+                            content_col =
+                                content_col.push(cosmic::widget::divider::horizontal::default());
+                        }
                     }
                     Some(MenuTarget::Pinned { app_id }) => {
                         let app_id_clone = app_id.clone();
@@ -1461,6 +1499,23 @@ impl AppModel {
                         .insert(app_id.clone(), DesktopAppInfo { path, name });
                 }
             }
+        }
+    }
+
+    /// Unified helper to focus or center windows cleanly without redundant IPC actions
+    fn focus_or_center_window(&mut self, window_id: u64, workspace_id: u64, center: bool) {
+        self.last_focused_window = Some(window_id);
+        self.rebuild_display();
+
+        if workspace_id > 0 {
+            self.send_action(Action::FocusWorkspace {
+                reference: niri_ipc::WorkspaceReferenceArg::Id(workspace_id),
+            });
+        }
+        self.send_action(Action::FocusWindow { id: window_id });
+
+        if center {
+            self.send_action(Action::CenterWindow { id: Some(window_id) });
         }
     }
 }
