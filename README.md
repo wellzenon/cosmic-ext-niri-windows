@@ -5,42 +5,62 @@ https://github.com/user-attachments/assets/7fec42dc-a27e-4169-ab17-7553a277453a
 
 `cosmic-ext-niri-windows` is a niri window list applet for the COSMIC Desktop panel (`cosmic-panel`). 
 
-- **Monitor Output Filtering**: shows only per monitor windows, but all workspaces from that monitor.
-
-- ==**Drag and Drop**==: Dragging and dropping icons will move the windows.
+- **Monitor Output Filtering**: Shows only per-monitor windows, across all workspaces on that monitor.
+- **Drag and Drop**: Dragging and dropping icons reorders or moves windows across workspaces.
 - **Left Click**: Focuses the window.
 - **Double Left Click**: Centers the window.
 - **Middle Click**: Closes the window.
-- **Right Click**: Opens ==Context Menu==.
-- **Scroll Wheel / Touchpad**: Changes workspaces.
+- **Right Click**: Opens Context Menu.
+- **Scroll Wheel / Touchpad**: Switches workspaces.
 
-- ==**Context Menu**==:
-  - **Anywhere on the bar**:
-    1. **Show workspaces names**: Toggle workspaces names visibility.
-  - **Over an open window icon**:
-    1. **Close application**
-    2. **Column width**: Based on Niri's config column width steps.
-    3. **Pin Application**: Toggles pinned/unpinned application state.
+- **Context Menu**:
+  - **Show workspace names**: Toggle workspace name labels.
+  - **Close Application**: Closes target window.
+  - **Column Width**: Dynamic column width presets based on Niri's `config.kdl` steps.
+  - **Pin Application**: Toggle pinned shortcuts for favorite apps.
 
 
-## Installation & Running
+## 📦 Installation
 
-### Through Flathub
-
-Search for cosmic ext niri windows
-
-### Building locally
-
-This project uses `just` as a runner.
-
-#### Install Locally
-Installs the binary to `~/.local/bin` and copies the `.desktop` launcher to `~/.local/share/applications/` (no root permissions required):
+### 1. Arch Linux (AUR)
+Install the pre-compiled binary package directly from the AUR using your favorite AUR helper:
 ```bash
-just install
+yay -S cosmic-ext-niri-windows-bin
+```
+*(or `paru -S cosmic-ext-niri-windows-bin`)*
+
+---
+
+### 2. Flatpak Bundle (Universal Linux)
+Download the `.flatpak` bundle from the latest [GitHub Release](https://github.com/wellzenon/cosmic-ext-niri-windows/releases) and install it:
+```bash
+flatpak install ./cosmic-ext-niri-windows.flatpak
 ```
 
-##### Apply Changes
-To restart the panel and reload the applet:
+---
+
+### 3. Cargo (Any Linux distro with Rust)
+Install directly from source using Cargo:
 ```bash
+cargo install --git https://github.com/wellzenon/cosmic-ext-niri-windows
+```
+
+---
+
+### 4. Building Locally (For Developers)
+
+This project uses `just` for workflow automation.
+
+```bash
+# Build native binary
+just build
+
+# Test in COSMIC panel
+just test
+
+# Install locally to ~/.local/bin
+just install
+
+# Restart panel to apply changes
 just restart-panel
 ```
