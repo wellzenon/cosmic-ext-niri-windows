@@ -1,6 +1,7 @@
 # ✨VIBECODED✨ COSMIC Niri Windows Applet
 
-https://github.com/user-attachments/assets/ed827859-49ab-4df1-8ba4-ebcc8baf6d0c
+https://github.com/user-attachments/assets/7fec42dc-a27e-4169-ab17-7553a277453a
+
 
 `cosmic-ext-niri-windows` is a niri window list applet for the COSMIC Desktop panel (`cosmic-panel`). 
 
