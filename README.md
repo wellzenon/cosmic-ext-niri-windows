@@ -20,7 +20,7 @@ https://github.com/user-attachments/assets/7fec42dc-a27e-4169-ab17-7553a277453a
   - **Pin Application**: Toggle pinned shortcuts for favorite apps.
 
 
-## 📦 Installation
+## Installation
 
 ### 1. Arch Linux (AUR)
 Install the pre-compiled binary package directly from the AUR using your favorite AUR helper:
@@ -29,25 +29,19 @@ yay -S cosmic-ext-niri-windows-bin
 ```
 *(or `paru -S cosmic-ext-niri-windows-bin`)*
 
----
-
-### 2. Flatpak Bundle (Universal Linux)
+### 2. Flatpak Bundle 
 Download the `.flatpak` bundle from the latest [GitHub Release](https://github.com/wellzenon/cosmic-ext-niri-windows/releases) and install it:
 ```bash
 flatpak install ./cosmic-ext-niri-windows.flatpak
 ```
 
----
-
-### 3. Cargo (Any Linux distro with Rust)
+### 3. Cargo 
 Install directly from source using Cargo:
 ```bash
 cargo install --git https://github.com/wellzenon/cosmic-ext-niri-windows
 ```
 
----
-
-### 4. Building Locally (For Developers)
+### 4. Building Locally
 
 This project uses `just` for workflow automation.
 
