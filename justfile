@@ -33,8 +33,19 @@ add-to-panel:
 
 # restart cosmic-panel to reload applets (prevents duplicate bar instances)
 restart-panel:
-    pkill -x cosmic-panel || true
-    @sleep 0.8
+    @pkill -x cosmic-panel || true
+    @sleep 1.2
+    @pgrep -x cosmic-panel >/dev/null || (cosmic-panel &)
+
+# build and install the flatpak package locally (uses cache for fast rebuilds)
+build-flatpak:
+    flatpak-builder --force-clean --disable-rofiles-fuse --user --install build-dir io.github.wellzenon.CosmicExtNiriWindows.yml
+
+# switch panel to run already built flatpak version
+test-flatpak:
+    rm -f ~/.local/share/applications/io.github.wellzenon.CosmicExtNiriWindows.desktop
+    @pkill -x cosmic-panel || true
+    @sleep 1.2
     @pgrep -x cosmic-panel >/dev/null || (cosmic-panel &)
 
 # check the applet

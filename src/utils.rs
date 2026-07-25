@@ -7,6 +7,8 @@ fn get_application_dirs() -> Vec<PathBuf> {
     let mut dirs = vec![
         PathBuf::from("/usr/share/applications"),
         PathBuf::from("/usr/local/share/applications"),
+        PathBuf::from("/run/host/usr/share/applications"),
+        PathBuf::from("/run/host/share/applications"),
     ];
 
     if let Some(home_dir) = dirs::home_dir() {
@@ -46,6 +48,9 @@ pub fn resolve_icon_name_to_path(icon_name: &str) -> Option<String> {
     search_dirs.push(PathBuf::from("/usr/share/pixmaps"));
     search_dirs.push(PathBuf::from("/usr/local/share/icons"));
     search_dirs.push(PathBuf::from("/usr/local/share/pixmaps"));
+    search_dirs.push(PathBuf::from("/run/host/usr/share/icons"));
+    search_dirs.push(PathBuf::from("/run/host/usr/share/pixmaps"));
+    search_dirs.push(PathBuf::from("/run/host/share/icons"));
 
     let icon_lower = icon_name.to_lowercase();
     let target_names = [
@@ -239,24 +244,44 @@ pub struct ColumnPreset {
 pub fn load_niri_column_presets() -> Vec<ColumnPreset> {
     let mut presets = Vec::new();
 
+    let mut possible_paths = Vec::new();
+    if let Some(home_dir) = dirs::home_dir() {
+        possible_paths.push(home_dir.join(".config").join("niri").join("config.kdl"));
+    }
     if let Some(config_dir) = dirs::config_dir() {
-        let niri_config = config_dir.join("niri").join("config.kdl");
+        possible_paths.push(config_dir.join("niri").join("config.kdl"));
+    }
+
+    for niri_config in possible_paths {
         if let Ok(content) = fs::read_to_string(&niri_config) {
             let mut in_preset_block = false;
             for line in content.lines() {
-                let trimmed = line.trim();
-                if trimmed.starts_with("preset-column-widths") {
+                // Strip KDL comments
+                let line_clean = if let Some(idx) = line.find("//") {
+                    &line[..idx]
+                } else {
+                    line
+                };
+                let trimmed = line_clean.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                if trimmed.contains("preset-column-widths") {
                     in_preset_block = true;
                     continue;
                 }
                 if in_preset_block {
-                    if trimmed == "}" {
+                    if trimmed.contains('}') {
                         break;
                     }
-                    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                    // Clean trailing semicolons or braces
+                    let clean_line = trimmed.trim_matches(|c| c == ';' || c == '{' || c == '}');
+                    let parts: Vec<&str> = clean_line.split_whitespace().collect();
                     if parts.len() >= 2 {
                         if parts[0] == "proportion" {
-                            if let Ok(val) = parts[1].parse::<f64>() {
+                            let raw_val = parts[1].trim_matches(';');
+                            if let Ok(val) = raw_val.parse::<f64>() {
                                 let pct = (val * 100.0).round() as u32;
                                 presets.push(ColumnPreset {
                                     label: format!("{pct}%"),
@@ -264,7 +289,8 @@ pub fn load_niri_column_presets() -> Vec<ColumnPreset> {
                                 });
                             }
                         } else if parts[0] == "fixed" {
-                            if let Ok(val) = parts[1].parse::<i32>() {
+                            let raw_val = parts[1].trim_matches(';');
+                            if let Ok(val) = raw_val.parse::<i32>() {
                                 presets.push(ColumnPreset {
                                     label: format!("{val}px"),
                                     change_spec: format!("{val}"),

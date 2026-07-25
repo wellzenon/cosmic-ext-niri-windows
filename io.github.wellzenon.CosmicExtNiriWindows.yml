@@ -13,16 +13,13 @@ finish-args:
   - --device=dri
   # Dynamic Niri IPC socket access (/run/user/$UID/niri.wayland-*.sock)
   - --filesystem=/run/user:rw
-  # Application & Icon access for taskbar icons
-  - --filesystem=xdg-data/applications:ro
-  - --filesystem=xdg-data/icons:ro
+  # Host filesystem access for apps, icons, and niri config
+  - --filesystem=host:ro
   - --filesystem=~/.local/share/applications:ro
   - --filesystem=~/.local/share/icons:ro
   - --filesystem=~/.icons:ro
-  # COSMIC Theme & Host OS access
-  - --filesystem=xdg-config/cosmic:ro
+  - --filesystem=~/.config/niri:ro
   - --filesystem=~/.config/cosmic:ro
-  - --filesystem=host-os:ro
   # COSMIC & Freedesktop DBus services
   - --talk-name=com.system76.CosmicTheme
   - --talk-name=com.system76.CosmicTk
