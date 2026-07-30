@@ -968,6 +968,21 @@ impl cosmic::Application for AppModel {
 impl AppModel {
     fn handle_niri_event(&mut self, event: Event) -> Task<cosmic::Action<Message>> {
         match event {
+            Event::WorkspacesChanged { workspaces } => {
+                // Update raw_workspaces based on the complete list provided by Niri
+                self.raw_workspaces.retain(|id, _| workspaces.iter().any(|w| w.id == *id));
+                for ws in workspaces {
+                    if let Some(existing) = self.raw_workspaces.get_mut(&ws.id) {
+                        existing.idx = ws.idx;
+                        existing.name = ws.name.clone();
+                        existing.output = ws.output.clone();
+                        existing.active_window_id = ws.active_window_id;
+                    } else {
+                        self.raw_workspaces.insert(ws.id, ws.clone());
+                    }
+                }
+                Task::none()
+            }
             Event::WorkspaceActivated { id, focused } => {
                 if let Some(ws) = self.raw_workspaces.get_mut(&id) {
                     ws.is_active = true;
@@ -1149,13 +1164,14 @@ impl AppModel {
         if let Some((window_id, current_ws_id)) = dragged_window_info {
             if self.has_drag_moved {
                 if target_workspace_id != current_ws_id {
+                    let target_idx = self.raw_workspaces.get(&target_workspace_id).map(|w| w.idx).unwrap_or(0);
                     self.send_action(Action::MoveWindowToWorkspace {
                         window_id: Some(window_id),
-                        reference: niri_ipc::WorkspaceReferenceArg::Id(target_workspace_id),
+                        reference: niri_ipc::WorkspaceReferenceArg::Index(target_idx),
                         focus: true,
                     });
                     self.send_action(Action::FocusWorkspace {
-                        reference: niri_ipc::WorkspaceReferenceArg::Id(target_workspace_id),
+                        reference: niri_ipc::WorkspaceReferenceArg::Index(target_idx),
                     });
                     self.send_action(Action::FocusWindow { id: window_id });
 
@@ -1527,8 +1543,9 @@ impl AppModel {
         self.last_focused_window = Some(window_id);
 
         if workspace_id > 0 {
+            let target_idx = self.raw_workspaces.get(&workspace_id).map(|w| w.idx).unwrap_or(0);
             self.send_action(Action::FocusWorkspace {
-                reference: niri_ipc::WorkspaceReferenceArg::Id(workspace_id),
+                reference: niri_ipc::WorkspaceReferenceArg::Index(target_idx),
             });
         }
         self.send_action(Action::FocusWindow { id: window_id });
