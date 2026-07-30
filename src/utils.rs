@@ -35,22 +35,31 @@ pub fn resolve_icon_name_to_path(icon_name: &str) -> Option<String> {
         return Some(icon_name.to_string());
     }
 
-    // Standard search directories for icons
     let mut search_dirs = Vec::new();
-    if let Some(home_dir) = dirs::home_dir() {
-        search_dirs.push(home_dir.join(".local/share/icons"));
-        search_dirs.push(home_dir.join(".icons"));
+    if crate::launcher::is_flatpak() {
+        search_dirs.push(PathBuf::from("/run/host/usr/share/icons"));
+        search_dirs.push(PathBuf::from("/run/host/usr/share/pixmaps"));
+        search_dirs.push(PathBuf::from("/run/host/share/icons"));
+        if let Some(home_dir) = dirs::home_dir() {
+            search_dirs.push(home_dir.join(".local/share/icons"));
+            search_dirs.push(home_dir.join(".icons"));
+        }
+    } else {
+        if let Some(home_dir) = dirs::home_dir() {
+            search_dirs.push(home_dir.join(".local/share/icons"));
+            search_dirs.push(home_dir.join(".icons"));
+        }
+        if let Some(data_dir) = dirs::data_dir() {
+            search_dirs.push(data_dir.join("icons"));
+        }
+        search_dirs.push(PathBuf::from("/usr/share/icons"));
+        search_dirs.push(PathBuf::from("/usr/share/pixmaps"));
+        search_dirs.push(PathBuf::from("/usr/local/share/icons"));
+        search_dirs.push(PathBuf::from("/usr/local/share/pixmaps"));
+        search_dirs.push(PathBuf::from("/run/host/usr/share/icons"));
+        search_dirs.push(PathBuf::from("/run/host/usr/share/pixmaps"));
+        search_dirs.push(PathBuf::from("/run/host/share/icons"));
     }
-    if let Some(data_dir) = dirs::data_dir() {
-        search_dirs.push(data_dir.join("icons"));
-    }
-    search_dirs.push(PathBuf::from("/usr/share/icons"));
-    search_dirs.push(PathBuf::from("/usr/share/pixmaps"));
-    search_dirs.push(PathBuf::from("/usr/local/share/icons"));
-    search_dirs.push(PathBuf::from("/usr/local/share/pixmaps"));
-    search_dirs.push(PathBuf::from("/run/host/usr/share/icons"));
-    search_dirs.push(PathBuf::from("/run/host/usr/share/pixmaps"));
-    search_dirs.push(PathBuf::from("/run/host/share/icons"));
 
     let icon_lower = icon_name.to_lowercase();
     let target_names = [
@@ -75,7 +84,22 @@ pub fn resolve_icon_name_to_path(icon_name: &str) -> Option<String> {
         }
     }
 
-    // 2. Check hicolor fallback theme first, as it's the standard fallback
+    // 2. Check active user icon theme first if set
+    if let Some(theme) = get_current_icon_theme() {
+        for dir in &search_dirs {
+            if !dir.exists() || dir.ends_with("pixmaps") {
+                continue;
+            }
+            let theme_dir = dir.join(&theme);
+            if theme_dir.exists() {
+                if let Some(found_path) = search_in_dir_recursive(&theme_dir, &target_names, 0, 5) {
+                    return Some(found_path.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+
+    // 3. Check hicolor fallback theme first, as it's the standard fallback
     for dir in &search_dirs {
         if !dir.exists() || dir.ends_with("pixmaps") {
             continue;
@@ -88,7 +112,7 @@ pub fn resolve_icon_name_to_path(icon_name: &str) -> Option<String> {
         }
     }
 
-    // 3. Search other directories recursively (limiting depth to prevent long delays)
+    // 4. Search other directories recursively (limiting depth to prevent long delays)
     for dir in &search_dirs {
         if !dir.exists() || dir.ends_with("pixmaps") {
             continue;
@@ -98,6 +122,24 @@ pub fn resolve_icon_name_to_path(icon_name: &str) -> Option<String> {
         }
     }
 
+    None
+}
+
+/// Retrieves the user's currently configured GTK icon theme name.
+pub fn get_current_icon_theme() -> Option<String> {
+    if let Ok(output) = std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.interface", "icon-theme"])
+        .output()
+    {
+        let s = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .trim_matches('\'')
+            .trim_matches('"')
+            .to_string();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
     None
 }
 
@@ -155,6 +197,15 @@ pub fn find_fallback_icon(app_id: &str) -> Option<String> {
 
     // 2. Fallback: resolve app_id directly as icon name
     resolve_icon_name_to_path(app_id)
+}
+/// Resolves the canonical desktop entry ID (e.g. "org.neovim.nvim") for a given running app_id (e.g. "nvim").
+pub fn resolve_canonical_desktop_id(app_id: &str) -> String {
+    if let Some(desktop_path) = find_desktop_file_path(app_id) {
+        if let Some(stem) = desktop_path.file_stem().and_then(|s| s.to_str()) {
+            return stem.to_string();
+        }
+    }
+    app_id.to_string()
 }
 
 /// Searches desktop files to retrieve the absolute path for a given app_id.
@@ -303,7 +354,7 @@ pub fn load_niri_column_presets() -> Vec<ColumnPreset> {
         }
     }
 
-    if presets.is_empty() {
+    let raw_presets = if presets.is_empty() {
         // Fallback default presets if config.kdl does not specify preset-column-widths
         vec![
             ColumnPreset {
@@ -321,5 +372,79 @@ pub fn load_niri_column_presets() -> Vec<ColumnPreset> {
         ]
     } else {
         presets
+    };
+
+    let mut unique_presets = Vec::new();
+    for p in raw_presets {
+        if !unique_presets.iter().any(|existing: &ColumnPreset| existing.label == p.label) {
+            unique_presets.push(p);
+        }
     }
+    unique_presets
 }
+
+/// Dynamically resolves the user's configured default terminal emulator command/binary
+/// without hardcoding specific terminal names.
+pub fn get_default_terminal_emulator() -> Option<String> {
+    // 1. $TERMINAL environment variable
+    if let Ok(term) = std::env::var("TERMINAL") {
+        let trimmed = term.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    // 2. ~/.config/xdg-terminals.list or ~/.config/xdg-default-terminal.list
+    if let Some(config_dir) = dirs::config_dir() {
+        for file in &["xdg-terminals.list", "xdg-default-terminal.list"] {
+            let path = config_dir.join(file);
+            if let Ok(content) = fs::read_to_string(path) {
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || trimmed.starts_with('#') {
+                        continue;
+                    }
+                    let clean = trimmed.strip_suffix(".desktop").unwrap_or(trimmed);
+                    let binary = clean.split('.').last().unwrap_or(clean);
+                    if !binary.is_empty() {
+                        return Some(binary.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. gsettings org.gnome.desktop.default-applications.terminal exec
+    if let Ok(output) = std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.default-applications.terminal", "exec"])
+        .output()
+    {
+        let s = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .trim_matches('\'')
+            .trim_matches('"')
+            .to_string();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+
+    // 4. dconf /org/gnome/desktop/default-applications/terminal/exec
+    if let Ok(output) = std::process::Command::new("dconf")
+        .args(["read", "/org/gnome/desktop/default-applications/terminal/exec"])
+        .output()
+    {
+        let s = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .trim_matches('\'')
+            .trim_matches('"')
+            .to_string();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+
+    None
+}
+
+

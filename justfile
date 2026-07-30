@@ -29,18 +29,28 @@ install:
     chmod +x ~/.local/share/applications/io.github.wellzenon.CosmicExtNiriWindows.desktop
 
 
-# Step 2: Test the built applet in the panel: 'flatpak' (default), 'aur', or 'native' (no rebuild)
-test target="flatpak":
+# Step 2: Test the built applet in the panel: 'native' (default), 'flatpak', or 'aur'
+test target="native":
     #!/usr/bin/env bash
-    if [ "{{target}}" = "flatpak" ]; then
+    if [ "{{target}}" = "native" ]; then
+        echo "==> Installing and testing NATIVE build in COSMIC panel..."
+        just install
+        pkill -x cosmic-panel || true
+        sleep 1.2
+        (cosmic-panel >/dev/null 2>&1 &)
+    elif [ "{{target}}" = "flatpak" ]; then
         echo "==> Testing FLATPAK build in COSMIC panel..."
         rm -f ~/.local/share/applications/io.github.wellzenon.CosmicExtNiriWindows.desktop
-        just restart-panel
-    elif [ "{{target}}" = "aur" ] || [ "{{target}}" = "native" ]; then
-        echo "==> Testing {{target}} build in COSMIC panel..."
-        just restart-panel
+        pkill -x cosmic-panel || true
+        sleep 1.2
+        (cosmic-panel >/dev/null 2>&1 &)
+    elif [ "{{target}}" = "aur" ]; then
+        echo "==> Testing AUR build in COSMIC panel..."
+        pkill -x cosmic-panel || true
+        sleep 1.2
+        (cosmic-panel >/dev/null 2>&1 &)
     else
-        echo "Invalid test target: {{target}}. Use 'just test', 'just test flatpak', ou 'just test aur'."
+        echo "Invalid test target: {{target}}. Use 'just test', 'just test native', or 'just test flatpak'."
         exit 1
     fi
 
@@ -65,9 +75,10 @@ run:
 
 # Restart cosmic-panel to reload applets
 restart-panel:
-    @pkill -x cosmic-panel || true
-    @sleep 1.2
-    @pgrep -x cosmic-panel >/dev/null || (cosmic-panel &)
+    #!/usr/bin/env bash
+    pkill -x cosmic-panel || true
+    sleep 1.2
+    (cosmic-panel >/dev/null 2>&1 &)
 
 # Add the applet to cosmic panel center section
 add-to-panel:

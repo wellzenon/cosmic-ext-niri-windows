@@ -1,4 +1,5 @@
 mod utils;
+mod launcher;
 mod app;
 mod niri;
 
