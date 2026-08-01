@@ -8,7 +8,10 @@ use iced_winit::platform_specific::commands::layer_surface::{
     KeyboardInteractivity, set_keyboard_interactivity,
 };
 use niri_ipc::{Action, Output, Reply, Request, Response, Window, Workspace};
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use tokio::time::Instant;
 
 #[derive(Debug, Clone)]
@@ -136,10 +139,22 @@ pub struct ContextMenuState {
     pub target: Option<MenuTarget>,
 }
 
-#[derive(Default)]
 pub struct IconCache {
     pub handles: HashMap<String, widget::icon::Handle>,
-    pub resolving: std::collections::HashSet<String>,
+    pub resolving: HashSet<String>,
+    resolver_limit: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for IconCache {
+    fn default() -> Self {
+        Self {
+            handles: HashMap::new(),
+            resolving: HashSet::new(),
+            // Icon themes can contain thousands of files. Avoid monopolizing the
+            // runtime when many windows appear at once.
+            resolver_limit: Arc::new(tokio::sync::Semaphore::new(2)),
+        }
+    }
 }
 
 pub struct AppModel {
@@ -152,12 +167,15 @@ pub struct AppModel {
     raw_windows: HashMap<u64, Window>,
     raw_workspaces: HashMap<u64, Workspace>,
     raw_outputs: HashMap<String, Output>,
+    windows_by_workspace: HashMap<u64, Vec<u64>>,
+    open_app_ids: HashSet<String>,
     column_presets: Vec<crate::utils::ColumnPreset>,
     last_focused_window: Option<u64>,
 
     // ── Pinned Apps ───────────────────────────────────────
     pinned: Vec<String>,
     desktop_info_cache: HashMap<String, DesktopAppInfo>,
+    canonical_app_ids: HashMap<String, String>,
 
     // ── Grouped State ─────────────────────────────────────
     icons: IconCache,
@@ -296,10 +314,13 @@ impl cosmic::Application for AppModel {
             last_mouse_pos: cosmic::iced::Point::default(),
             pinned: load_pinned(),
             desktop_info_cache: HashMap::new(),
+            canonical_app_ids: HashMap::new(),
             hovered_target: None,
             ignore_next_applet_right_click: false,
             column_presets: crate::utils::load_niri_column_presets(),
             raw_outputs: HashMap::new(),
+            windows_by_workspace: HashMap::new(),
+            open_app_ids: HashSet::new(),
             launcher: crate::launcher::SystemLauncher::detect(),
             icons: IconCache::default(),
             menu: ContextMenuState::default(),
@@ -401,11 +422,7 @@ impl cosmic::Application for AppModel {
         let mut workspaces: Vec<&niri_ipc::Workspace> = self.raw_workspaces.values().collect();
         workspaces.sort_unstable_by_key(|ws| ws.idx);
 
-        let has_active_windows = workspaces.iter().any(|ws| {
-            self.raw_windows
-                .values()
-                .any(|w| w.workspace_id == Some(ws.id) && w.app_id.as_deref() != Some(Self::APP_ID))
-        });
+        let has_active_windows = !self.windows_by_workspace.is_empty();
 
         let icon_size: u16 = match &self.core.applet.size {
             cosmic::applet::Size::Hardcoded((w, h)) => *w.min(h),
@@ -446,13 +463,10 @@ impl cosmic::Application for AppModel {
 
         let mut children = Vec::new();
 
-        let has_inactive_pinned = self.pinned.iter().any(|app_id| {
-            !self.raw_windows.values().any(|w| {
-                w.app_id.as_ref().is_some_and(|id| {
-                    id == app_id || &crate::utils::resolve_canonical_desktop_id(id) == app_id
-                })
-            })
-        });
+        let has_inactive_pinned = self
+            .pinned
+            .iter()
+            .any(|app_id| !self.open_app_ids.contains(app_id));
 
         if !has_active_windows && !has_inactive_pinned {
             children.push(
@@ -475,11 +489,7 @@ impl cosmic::Application for AppModel {
             // Render Pinned Icons (closed apps only)
             let mut has_pinned = false;
             for (idx, app_id) in self.pinned.iter().enumerate() {
-                let is_open = self.raw_windows.values().any(|w| {
-                    w.app_id.as_ref().is_some_and(|id| {
-                        id == app_id || &crate::utils::resolve_canonical_desktop_id(id) == app_id
-                    })
-                });
+                let is_open = self.open_app_ids.contains(app_id);
 
                 if !is_open {
                     has_pinned = true;
@@ -546,20 +556,9 @@ impl cosmic::Application for AppModel {
             }
 
             for workspace in &workspaces {
-                let mut ws_windows: Vec<&niri_ipc::Window> = self
-                    .raw_windows
-                    .values()
-                    .filter(|w| w.workspace_id == Some(workspace.id))
-                    .filter(|w| w.app_id.as_deref() != Some(Self::APP_ID))
-                    .collect();
-                if ws_windows.is_empty() {
+                let Some(window_ids) = self.windows_by_workspace.get(&workspace.id) else {
                     continue;
-                }
-                ws_windows.sort_unstable_by_key(|w| {
-                    w.layout
-                        .pos_in_scrolling_layout
-                        .unwrap_or((usize::MAX, usize::MAX))
-                });
+                };
 
                 if !is_first_ws || has_pinned || !self.show_workspace_name {
                     let mid_div = cosmic::iced::widget::mouse_area(make_divider(
@@ -600,7 +599,10 @@ impl cosmic::Application for AppModel {
                     children.push(label_container.into());
                 }
 
-                for window in &ws_windows {
+                for window_id in window_ids {
+                    let Some(window) = self.raw_windows.get(window_id) else {
+                        continue;
+                    };
                     let is_focused = Some(window.id) == self.last_focused_window;
                     let icon_handle =
                         self.get_icon_handle(window.app_id.as_deref(), render_icon_size);
@@ -824,17 +826,16 @@ impl cosmic::Application for AppModel {
             )
         });
 
-        let global_sub = cosmic::iced::event::listen_with(|event, _status, _window_id| {
-            match event {
+        let global_sub =
+            cosmic::iced::event::listen_with(|event, _status, _window_id| match event {
                 cosmic::iced::Event::Mouse(cosmic::iced::mouse::Event::ButtonReleased(
                     cosmic::iced::mouse::Button::Left,
                 )) => Some(Message::DragEnd),
-                cosmic::iced::Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed { .. }) => {
-                    Some(Message::ClosePopupAndDrag)
-                }
+                cosmic::iced::Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
+                    ..
+                }) => Some(Message::ClosePopupAndDrag),
                 _ => None,
-            }
-        });
+            });
 
         let subs = vec![niri_sub, global_sub];
 
@@ -852,7 +853,7 @@ impl cosmic::Application for AppModel {
                     .map(|ws| (ws.id, ws))
                     .collect();
 
-                self.raw_windows = wins
+                let mut windows: HashMap<u64, Window> = wins
                     .into_iter()
                     .filter(|w| {
                         w.workspace_id
@@ -860,6 +861,11 @@ impl cosmic::Application for AppModel {
                     })
                     .map(|w| (w.id, w))
                     .collect();
+                for window in windows.values_mut() {
+                    self.normalize_window_app_id(window);
+                }
+                self.raw_windows = windows;
+                self.rebuild_window_index();
 
                 if let Some(w) = self.raw_windows.values().find(|w| w.is_focused) {
                     self.last_focused_window = Some(w.id);
@@ -961,7 +967,7 @@ impl cosmic::Application for AppModel {
                 if let Some(task) = self.close_popup() {
                     tasks.push(task);
                 }
-                
+
                 let window_ids: Vec<u64> = self.width_slider.dragging.keys().copied().collect();
                 for window_id in window_ids {
                     self.handle_column_width_slider_released(window_id);
@@ -989,11 +995,7 @@ impl AppModel {
         }
     }
 
-    fn handle_column_width_slider_changed(
-        &mut self,
-        window_id: u64,
-        val: u32,
-    ) {
+    fn handle_column_width_slider_changed(&mut self, window_id: u64, val: u32) {
         let current_width = self
             .width_slider
             .dragging
@@ -1009,10 +1011,7 @@ impl AppModel {
         self.send_column_width_action(window_id, val as f64, true);
     }
 
-    fn handle_column_width_slider_released(
-        &mut self,
-        window_id: u64,
-    ) {
+    fn handle_column_width_slider_released(&mut self, window_id: u64) {
         if let Some(val) = self.width_slider.dragging.remove(&window_id) {
             self.send_column_width_action(window_id, val as f64, true);
         }
@@ -1125,7 +1124,13 @@ impl AppModel {
                         }
                     }
                 }
-                fetch_outputs_async().map(cosmic::Action::from)
+                self.raw_windows.retain(|_, window| {
+                    window
+                        .workspace_id
+                        .is_some_and(|id| self.raw_workspaces.contains_key(&id))
+                });
+                self.rebuild_window_index();
+                Task::none()
             }
             Event::WorkspaceActivated { id, focused } => {
                 if let Some(ws) = self.raw_workspaces.get_mut(&id) {
@@ -1138,10 +1143,10 @@ impl AppModel {
                         }
                     }
                 }
-                fetch_outputs_async().map(cosmic::Action::from)
+                Task::none()
             }
             Event::WindowsChanged { windows } => {
-                self.raw_windows = windows
+                let mut raw_windows: HashMap<u64, Window> = windows
                     .into_iter()
                     .filter(|w| {
                         w.workspace_id
@@ -1149,11 +1154,17 @@ impl AppModel {
                     })
                     .map(|w| (w.id, w))
                     .collect();
+                for window in raw_windows.values_mut() {
+                    self.normalize_window_app_id(window);
+                }
+                self.raw_windows = raw_windows;
+                self.rebuild_window_index();
 
                 self.update_last_focused_window();
                 self.spawn_missing_icon_tasks()
             }
-            Event::WindowOpenedOrChanged { window } => {
+            Event::WindowOpenedOrChanged { mut window } => {
+                self.normalize_window_app_id(&mut window);
                 let id = window.id;
                 let is_focused = window.is_focused;
 
@@ -1162,6 +1173,7 @@ impl AppModel {
                     .is_some_and(|ws_id| self.raw_workspaces.contains_key(&ws_id))
                 {
                     self.raw_windows.insert(id, window);
+                    self.rebuild_window_index();
                     if is_focused {
                         self.last_focused_window = Some(id);
                     }
@@ -1172,6 +1184,7 @@ impl AppModel {
                     {
                         self.update_last_focused_window();
                     }
+                    self.rebuild_window_index();
                     Task::none()
                 }
             }
@@ -1179,6 +1192,7 @@ impl AppModel {
                 if self.raw_windows.remove(&id).is_some() && self.last_focused_window == Some(id) {
                     self.update_last_focused_window();
                 }
+                self.rebuild_window_index();
                 Task::none()
             }
             Event::WindowFocusChanged { id } => {
@@ -1201,6 +1215,9 @@ impl AppModel {
                         w.layout = new_layout;
                     }
                 }
+                // Window order is derived from `pos_in_scrolling_layout`. Keep the
+                // render index synchronized with live drag/reorder events.
+                self.rebuild_window_index();
                 Task::none()
             }
             Event::ConfigLoaded { .. } => fetch_outputs_async().map(cosmic::Action::from),
@@ -1257,7 +1274,7 @@ impl AppModel {
     }
 
     fn handle_pin_app(&mut self, raw_app_id: String) -> Task<cosmic::Action<Message>> {
-        let canonical_id = crate::utils::resolve_canonical_desktop_id(&raw_app_id);
+        let canonical_id = self.canonical_app_id(&raw_app_id);
         if !self.pinned.contains(&canonical_id) {
             self.pinned.push(canonical_id.clone());
             let save_task = save_pinned_task(self.pinned.clone());
@@ -1283,7 +1300,7 @@ impl AppModel {
     }
 
     fn handle_unpin_app(&mut self, raw_app_id: String) -> Task<cosmic::Action<Message>> {
-        let canonical_id = crate::utils::resolve_canonical_desktop_id(&raw_app_id);
+        let canonical_id = self.canonical_app_id(&raw_app_id);
         if let Some(pos) = self
             .pinned
             .iter()
@@ -1404,12 +1421,11 @@ impl AppModel {
             }
         }
 
-        let fetch_task = fetch_outputs_async().map(cosmic::Action::from);
         if let Some(task) = self.close_popup() {
-            Task::batch(vec![task, fetch_task])
+            task
         } else {
             self.menu.target = Some(target);
-            Task::batch(vec![self.open_context_menu(), fetch_task])
+            self.open_context_menu()
         }
     }
 
@@ -1427,10 +1443,21 @@ impl AppModel {
     }
 
     fn resolve_icon_async(&self, app_id_str: String) -> Task<Message> {
+        let resolver_limit = Arc::clone(&self.icons.resolver_limit);
         Task::perform(
             async move {
-                let icon_name = crate::utils::find_fallback_icon(&app_id_str)
-                    .unwrap_or_else(|| app_id_str.clone());
+                let _permit = resolver_limit
+                    .acquire_owned()
+                    .await
+                    .expect("icon resolver semaphore is never closed");
+                let lookup_id = app_id_str.clone();
+                let icon_name = tokio::task::spawn_blocking(move || {
+                    crate::utils::find_fallback_icon(&lookup_id)
+                })
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| app_id_str.clone());
 
                 let icon_name_clean = if icon_name.starts_with("file://") {
                     icon_name.trim_start_matches("file://").to_string()
@@ -1557,12 +1584,11 @@ impl AppModel {
 
         // 3. Pin window (Pin Application)
         if let Some(app_id_str) = app_id {
-            let canonical = crate::utils::resolve_canonical_desktop_id(app_id_str);
-            let is_pinned = self.pinned.contains(&canonical);
+            let is_pinned = self.pinned.contains(app_id_str);
             let pin_action = if is_pinned {
-                Message::UnpinApp(canonical.clone())
+                Message::UnpinApp(app_id_str.clone())
             } else {
-                Message::PinApp(canonical)
+                Message::PinApp(app_id_str.clone())
             };
 
             let pin_toggler = widget::toggler(is_pinned)
@@ -1670,6 +1696,57 @@ impl AppModel {
             .map(|w| w.id);
     }
 
+    fn canonical_app_id(&mut self, app_id: &str) -> String {
+        if let Some(canonical) = self.canonical_app_ids.get(app_id) {
+            return canonical.clone();
+        }
+
+        let canonical = crate::utils::resolve_canonical_desktop_id(app_id);
+        self.canonical_app_ids
+            .insert(app_id.to_owned(), canonical.clone());
+        self.canonical_app_ids
+            .entry(canonical.clone())
+            .or_insert_with(|| canonical.clone());
+        canonical
+    }
+
+    fn normalize_window_app_id(&mut self, window: &mut Window) {
+        if let Some(app_id) = window.app_id.take() {
+            window.app_id = Some(self.canonical_app_id(&app_id));
+        }
+    }
+
+    /// Rebuild render-only indexes when Niri state changes, never while rendering.
+    fn rebuild_window_index(&mut self) {
+        self.windows_by_workspace.clear();
+        self.open_app_ids.clear();
+
+        for window in self.raw_windows.values() {
+            if window.app_id.as_deref() == Some(<Self as cosmic::Application>::APP_ID) {
+                continue;
+            }
+            if let Some(workspace_id) = window.workspace_id {
+                self.windows_by_workspace
+                    .entry(workspace_id)
+                    .or_default()
+                    .push(window.id);
+            }
+            if let Some(app_id) = &window.app_id {
+                self.open_app_ids.insert(app_id.clone());
+            }
+        }
+
+        let windows = &self.raw_windows;
+        for ids in self.windows_by_workspace.values_mut() {
+            ids.sort_unstable_by_key(|id| {
+                windows
+                    .get(id)
+                    .and_then(|window| window.layout.pos_in_scrolling_layout)
+                    .unwrap_or((usize::MAX, usize::MAX))
+            });
+        }
+    }
+
     fn close_popup(&mut self) -> Option<Task<cosmic::Action<Message>>> {
         self.menu.popup_id.take().map(|popup_id| {
             self.menu.target = None;
@@ -1680,14 +1757,14 @@ impl AppModel {
     }
 
     fn pre_cache_pinned_desktop_paths(&mut self) {
-        for app_id in &self.pinned {
-            if !self.desktop_info_cache.contains_key(app_id)
-                && let Some(path) = crate::utils::find_desktop_file_path(app_id)
+        for app_id in self.pinned.clone() {
+            if !self.desktop_info_cache.contains_key(&app_id)
+                && let Some(path) = crate::utils::find_desktop_file_path(&app_id)
             {
                 let name =
                     crate::utils::get_desktop_entry_name(&path).unwrap_or_else(|| app_id.clone());
                 self.desktop_info_cache
-                    .insert(app_id.clone(), DesktopAppInfo { path, name });
+                    .insert(app_id, DesktopAppInfo { path, name });
             }
         }
     }

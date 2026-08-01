@@ -1,6 +1,9 @@
-use std::path::{Path, PathBuf};
 use freedesktop_desktop_entry::DesktopEntry;
 use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+static CURRENT_ICON_THEME: OnceLock<Option<String>> = OnceLock::new();
 
 /// Standard application desktop entry directories.
 fn get_application_dirs() -> Vec<PathBuf> {
@@ -92,9 +95,10 @@ pub fn resolve_icon_name_to_path(icon_name: &str) -> Option<String> {
             }
             let theme_dir = dir.join(&theme);
             if theme_dir.exists()
-                && let Some(found_path) = search_in_dir_recursive(&theme_dir, &target_names, 0, 5) {
-                    return Some(found_path.to_string_lossy().into_owned());
-                }
+                && let Some(found_path) = search_in_dir_recursive(&theme_dir, &target_names, 0, 5)
+            {
+                return Some(found_path.to_string_lossy().into_owned());
+            }
         }
     }
 
@@ -105,9 +109,10 @@ pub fn resolve_icon_name_to_path(icon_name: &str) -> Option<String> {
         }
         let hicolor_dir = dir.join("hicolor");
         if hicolor_dir.exists()
-            && let Some(found_path) = search_in_dir_recursive(&hicolor_dir, &target_names, 0, 5) {
-                return Some(found_path.to_string_lossy().into_owned());
-            }
+            && let Some(found_path) = search_in_dir_recursive(&hicolor_dir, &target_names, 0, 5)
+        {
+            return Some(found_path.to_string_lossy().into_owned());
+        }
     }
 
     // 4. Search other directories recursively (limiting depth to prevent long delays)
@@ -125,20 +130,24 @@ pub fn resolve_icon_name_to_path(icon_name: &str) -> Option<String> {
 
 /// Retrieves the user's currently configured GTK icon theme name.
 pub fn get_current_icon_theme() -> Option<String> {
-    if let Ok(output) = std::process::Command::new("gsettings")
-        .args(["get", "org.gnome.desktop.interface", "icon-theme"])
-        .output()
-    {
-        let s = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .trim_matches('\'')
-            .trim_matches('"')
-            .to_string();
-        if !s.is_empty() {
-            return Some(s);
-        }
-    }
-    None
+    CURRENT_ICON_THEME
+        .get_or_init(|| {
+            if let Ok(output) = std::process::Command::new("gsettings")
+                .args(["get", "org.gnome.desktop.interface", "icon-theme"])
+                .output()
+            {
+                let theme = String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .trim_matches('\'')
+                    .trim_matches('"')
+                    .to_string();
+                if !theme.is_empty() {
+                    return Some(theme);
+                }
+            }
+            None
+        })
+        .clone()
 }
 
 fn search_in_dir_recursive(
@@ -161,16 +170,19 @@ fn search_in_dir_recursive(
                 }
                 subdirs.push(path);
             } else if path.is_file()
-                && let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
-                    for target in target_names {
-                        if filename == target {
-                            return Some(path);
-                        }
+                && let Some(filename) = path.file_name().and_then(|f| f.to_str())
+            {
+                for target in target_names {
+                    if filename == target {
+                        return Some(path);
                     }
                 }
+            }
         }
         for subdir in subdirs {
-            if let Some(found) = search_in_dir_recursive(&subdir, target_names, current_depth + 1, max_depth) {
+            if let Some(found) =
+                search_in_dir_recursive(&subdir, target_names, current_depth + 1, max_depth)
+            {
                 return Some(found);
             }
         }
@@ -183,12 +195,10 @@ pub fn find_fallback_icon(app_id: &str) -> Option<String> {
     // 1. Delegate desktop entry discovery to find_desktop_file_path
     if let Some(desktop_path) = find_desktop_file_path(app_id)
         && let Ok(entry) = DesktopEntry::from_path(&desktop_path, None::<&[&str]>)
-            && let Some(icon) = entry.icon() {
-                if let Some(resolved_path) = resolve_icon_name_to_path(icon) {
-                    return Some(resolved_path);
-                }
-                return Some(icon.to_string());
-            }
+        && let Some(icon) = entry.icon()
+    {
+        return Some(icon.to_string());
+    }
 
     // 2. Fallback: resolve app_id directly as icon name
     resolve_icon_name_to_path(app_id)
@@ -196,9 +206,10 @@ pub fn find_fallback_icon(app_id: &str) -> Option<String> {
 /// Resolves the canonical desktop entry ID (e.g. "org.neovim.nvim") for a given running app_id (e.g. "nvim").
 pub fn resolve_canonical_desktop_id(app_id: &str) -> String {
     if let Some(desktop_path) = find_desktop_file_path(app_id)
-        && let Some(stem) = desktop_path.file_stem().and_then(|s| s.to_str()) {
-            return stem.to_string();
-        }
+        && let Some(stem) = desktop_path.file_stem().and_then(|s| s.to_str())
+    {
+        return stem.to_string();
+    }
     app_id.to_string()
 }
 
@@ -214,10 +225,11 @@ pub fn find_desktop_file_path(app_id: &str) -> Option<PathBuf> {
     ];
 
     if app_id.contains('.')
-        && let Some(last_part) = app_id.split('.').next_back() {
-            search_names.push(format!("{}.desktop", last_part));
-            search_names.push(format!("{}.desktop", last_part.to_lowercase()));
-        }
+        && let Some(last_part) = app_id.split('.').next_back()
+    {
+        search_names.push(format!("{}.desktop", last_part));
+        search_names.push(format!("{}.desktop", last_part.to_lowercase()));
+    }
 
     for dir in &dirs {
         if !dir.exists() {
@@ -366,11 +378,17 @@ pub fn load_niri_column_presets() -> Vec<ColumnPreset> {
 
     let mut unique_presets = Vec::new();
     for p in raw_presets {
-        if !unique_presets.iter().any(|existing: &ColumnPreset| existing.label == p.label) {
+        if !unique_presets
+            .iter()
+            .any(|existing: &ColumnPreset| existing.label == p.label)
+        {
             unique_presets.push(p);
         }
     }
-    log::debug!("Loaded {} column presets from niri config", unique_presets.len());
+    log::debug!(
+        "Loaded {} column presets from niri config",
+        unique_presets.len()
+    );
     unique_presets
 }
 
@@ -407,7 +425,11 @@ pub fn get_default_terminal_emulator() -> Option<String> {
 
     // 3. gsettings org.gnome.desktop.default-applications.terminal exec
     if let Ok(output) = std::process::Command::new("gsettings")
-        .args(["get", "org.gnome.desktop.default-applications.terminal", "exec"])
+        .args([
+            "get",
+            "org.gnome.desktop.default-applications.terminal",
+            "exec",
+        ])
         .output()
     {
         let s = String::from_utf8_lossy(&output.stdout)
@@ -422,7 +444,10 @@ pub fn get_default_terminal_emulator() -> Option<String> {
 
     // 4. dconf /org/gnome/desktop/default-applications/terminal/exec
     if let Ok(output) = std::process::Command::new("dconf")
-        .args(["read", "/org/gnome/desktop/default-applications/terminal/exec"])
+        .args([
+            "read",
+            "/org/gnome/desktop/default-applications/terminal/exec",
+        ])
         .output()
     {
         let s = String::from_utf8_lossy(&output.stdout)
@@ -437,5 +462,3 @@ pub fn get_default_terminal_emulator() -> Option<String> {
 
     None
 }
-
-

@@ -1,4 +1,4 @@
-use niri_ipc::{socket::SOCKET_PATH_ENV, Reply};
+use niri_ipc::{Reply, socket::SOCKET_PATH_ENV};
 use tokio::{
     io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
@@ -15,7 +15,10 @@ impl Connection {
             let path_buf = std::path::PathBuf::from(&path);
             match UnixStream::connect(&path_buf).await {
                 Ok(s) => {
-                    log::debug!("Connected to Niri IPC via NIRI_SOCKET={}", path_buf.display());
+                    log::debug!(
+                        "Connected to Niri IPC via NIRI_SOCKET={}",
+                        path_buf.display()
+                    );
                     return Ok(Self(s));
                 }
                 Err(e) => {
@@ -66,7 +69,10 @@ impl Connection {
             for (path, _) in &candidates {
                 match UnixStream::connect(path).await {
                     Ok(s) => {
-                        log::debug!("Connected to Niri IPC via scanned socket {}", path.display());
+                        log::debug!(
+                            "Connected to Niri IPC via scanned socket {}",
+                            path.display()
+                        );
                         return Ok(Self(s));
                     }
                     Err(e) => {
@@ -80,18 +86,15 @@ impl Connection {
             }
         }
 
-        Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            {
-                let msg = format!(
-                    "Could not connect to any Niri IPC socket. NIRI_SOCKET={:?}, XDG_RUNTIME_DIR={}",
-                    std::env::var_os(SOCKET_PATH_ENV),
-                    runtime_dir.display()
-                );
-                log::error!("{}", msg);
-                msg
-            },
-        ))
+        Err(io::Error::new(io::ErrorKind::NotFound, {
+            let msg = format!(
+                "Could not connect to any Niri IPC socket. NIRI_SOCKET={:?}, XDG_RUNTIME_DIR={}",
+                std::env::var_os(SOCKET_PATH_ENV),
+                runtime_dir.display()
+            );
+            log::error!("{}", msg);
+            msg
+        }))
     }
 
     pub async fn into_listener(mut self) -> io::Result<Listener> {

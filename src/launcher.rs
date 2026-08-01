@@ -19,9 +19,9 @@ pub fn binary_exists(name: &str) -> bool {
         && let Ok(output) = std::process::Command::new("flatpak-spawn")
             .args(["--host", "which", name])
             .output()
-        {
-            return output.status.success();
-        }
+    {
+        return output.status.success();
+    }
     false
 }
 
@@ -126,7 +126,12 @@ impl SystemLauncher {
                         format!("exec uwsm app -- '{path_str}'"),
                     ]
                 } else {
-                    vec!["uwsm".to_string(), "app".to_string(), "--".to_string(), app_id.to_string()]
+                    vec![
+                        "uwsm".to_string(),
+                        "app".to_string(),
+                        "--".to_string(),
+                        app_id.to_string(),
+                    ]
                 }
             } else if self.has_gtk_launch {
                 vec!["gtk-launch".to_string(), app_id.to_string()]
@@ -134,10 +139,18 @@ impl SystemLauncher {
                 if let Some(ref path_str) = path_str_opt {
                     vec!["gio".to_string(), "launch".to_string(), path_str.clone()]
                 } else {
-                    vec!["sh".to_string(), "-c".to_string(), format!("exec '{exec_str}'")]
+                    vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        format!("exec '{exec_str}'"),
+                    ]
                 }
             } else {
-                vec!["sh".to_string(), "-c".to_string(), format!("exec '{exec_str}'")]
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("exec '{exec_str}'"),
+                ]
             }
         } else if self.has_uwsm {
             if let Some(ref path_str) = path_str_opt {
@@ -147,7 +160,12 @@ impl SystemLauncher {
                     format!("exec uwsm app -- '{path_str}'"),
                 ]
             } else {
-                vec!["uwsm".to_string(), "app".to_string(), "--".to_string(), app_id.to_string()]
+                vec![
+                    "uwsm".to_string(),
+                    "app".to_string(),
+                    "--".to_string(),
+                    app_id.to_string(),
+                ]
             }
         } else if self.has_gtk_launch {
             vec!["gtk-launch".to_string(), app_id.to_string()]
@@ -155,20 +173,40 @@ impl SystemLauncher {
             if let Some(ref path_str) = path_str_opt {
                 vec!["gio".to_string(), "launch".to_string(), path_str.clone()]
             } else {
-                vec!["sh".to_string(), "-c".to_string(), format!("exec '{app_id}'")]
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("exec '{app_id}'"),
+                ]
             }
         } else if let Some(exec) = cleaned_exec {
             if !exec.is_empty() {
                 vec!["sh".to_string(), "-c".to_string(), format!("exec {exec}")]
             } else if let Some(ref path_str) = path_str_opt {
-                vec!["sh".to_string(), "-c".to_string(), format!("exec '{path_str}'")]
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("exec '{path_str}'"),
+                ]
             } else {
-                vec!["sh".to_string(), "-c".to_string(), format!("exec '{app_id}'")]
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("exec '{app_id}'"),
+                ]
             }
         } else if let Some(ref path_str) = path_str_opt {
-            vec!["sh".to_string(), "-c".to_string(), format!("exec '{path_str}'")]
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("exec '{path_str}'"),
+            ]
         } else {
-            vec!["sh".to_string(), "-c".to_string(), format!("exec '{app_id}'")]
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("exec '{app_id}'"),
+            ]
         };
 
         let final_cmd = if self.is_flatpak {
