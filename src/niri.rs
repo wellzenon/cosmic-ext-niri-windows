@@ -61,7 +61,7 @@ impl Connection {
                 .collect();
 
             // Sort by most recently modified first
-            candidates.sort_by(|a, b| b.1.cmp(&a.1));
+            candidates.sort_by_key(|b| std::cmp::Reverse(b.1));
 
             for (path, _) in &candidates {
                 match UnixStream::connect(path).await {
@@ -94,7 +94,7 @@ impl Connection {
         ))
     }
 
-    pub async fn to_listener(mut self) -> io::Result<Listener> {
+    pub async fn into_listener(mut self) -> io::Result<Listener> {
         let _ = self.push_request(niri_ipc::Request::EventStream).await?;
         let reader = BufReader::new(self.0);
         Ok(Listener(reader))

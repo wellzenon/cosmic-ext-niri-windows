@@ -15,14 +15,13 @@ pub fn binary_exists(name: &str) -> bool {
             }
         }
     }
-    if is_flatpak() {
-        if let Ok(output) = std::process::Command::new("flatpak-spawn")
+    if is_flatpak()
+        && let Ok(output) = std::process::Command::new("flatpak-spawn")
             .args(["--host", "which", name])
             .output()
         {
             return output.status.success();
         }
-    }
     false
 }
 

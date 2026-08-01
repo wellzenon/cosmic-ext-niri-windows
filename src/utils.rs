@@ -91,11 +91,10 @@ pub fn resolve_icon_name_to_path(icon_name: &str) -> Option<String> {
                 continue;
             }
             let theme_dir = dir.join(&theme);
-            if theme_dir.exists() {
-                if let Some(found_path) = search_in_dir_recursive(&theme_dir, &target_names, 0, 5) {
+            if theme_dir.exists()
+                && let Some(found_path) = search_in_dir_recursive(&theme_dir, &target_names, 0, 5) {
                     return Some(found_path.to_string_lossy().into_owned());
                 }
-            }
         }
     }
 
@@ -105,11 +104,10 @@ pub fn resolve_icon_name_to_path(icon_name: &str) -> Option<String> {
             continue;
         }
         let hicolor_dir = dir.join("hicolor");
-        if hicolor_dir.exists() {
-            if let Some(found_path) = search_in_dir_recursive(&hicolor_dir, &target_names, 0, 5) {
+        if hicolor_dir.exists()
+            && let Some(found_path) = search_in_dir_recursive(&hicolor_dir, &target_names, 0, 5) {
                 return Some(found_path.to_string_lossy().into_owned());
             }
-        }
     }
 
     // 4. Search other directories recursively (limiting depth to prevent long delays)
@@ -158,19 +156,18 @@ fn search_in_dir_recursive(
             let path = entry.path();
             if path.is_dir() {
                 // Avoid recursing into hicolor again if we've already done that specifically
-                if current_depth == 0 && path.file_name().map_or(false, |n| n == "hicolor") {
+                if current_depth == 0 && path.file_name().is_some_and(|n| n == "hicolor") {
                     continue;
                 }
                 subdirs.push(path);
-            } else if path.is_file() {
-                if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
+            } else if path.is_file()
+                && let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
                     for target in target_names {
                         if filename == target {
                             return Some(path);
                         }
                     }
                 }
-            }
         }
         for subdir in subdirs {
             if let Some(found) = search_in_dir_recursive(&subdir, target_names, current_depth + 1, max_depth) {
@@ -184,27 +181,24 @@ fn search_in_dir_recursive(
 /// Finds the fallback icon name or resolved path for a given app_id.
 pub fn find_fallback_icon(app_id: &str) -> Option<String> {
     // 1. Delegate desktop entry discovery to find_desktop_file_path
-    if let Some(desktop_path) = find_desktop_file_path(app_id) {
-        if let Ok(entry) = DesktopEntry::from_path(&desktop_path, None::<&[&str]>) {
-            if let Some(icon) = entry.icon() {
+    if let Some(desktop_path) = find_desktop_file_path(app_id)
+        && let Ok(entry) = DesktopEntry::from_path(&desktop_path, None::<&[&str]>)
+            && let Some(icon) = entry.icon() {
                 if let Some(resolved_path) = resolve_icon_name_to_path(icon) {
                     return Some(resolved_path);
                 }
                 return Some(icon.to_string());
             }
-        }
-    }
 
     // 2. Fallback: resolve app_id directly as icon name
     resolve_icon_name_to_path(app_id)
 }
 /// Resolves the canonical desktop entry ID (e.g. "org.neovim.nvim") for a given running app_id (e.g. "nvim").
 pub fn resolve_canonical_desktop_id(app_id: &str) -> String {
-    if let Some(desktop_path) = find_desktop_file_path(app_id) {
-        if let Some(stem) = desktop_path.file_stem().and_then(|s| s.to_str()) {
+    if let Some(desktop_path) = find_desktop_file_path(app_id)
+        && let Some(stem) = desktop_path.file_stem().and_then(|s| s.to_str()) {
             return stem.to_string();
         }
-    }
     app_id.to_string()
 }
 
@@ -219,12 +213,11 @@ pub fn find_desktop_file_path(app_id: &str) -> Option<PathBuf> {
         format!("{}.desktop", app_id_lower),
     ];
 
-    if app_id.contains('.') {
-        if let Some(last_part) = app_id.split('.').last() {
+    if app_id.contains('.')
+        && let Some(last_part) = app_id.split('.').next_back() {
             search_names.push(format!("{}.desktop", last_part));
             search_names.push(format!("{}.desktop", last_part.to_lowercase()));
         }
-    }
 
     for dir in &dirs {
         if !dir.exists() {
@@ -257,14 +250,14 @@ pub fn find_desktop_file_path(app_id: &str) -> Option<PathBuf> {
 
                     // 2. Check StartupWMClass match
                     let path = e.path();
-                    if let Ok(entry) = DesktopEntry::from_path(&path, None::<&[&str]>) {
-                        if let Some(group) = entry.groups.group("Desktop Entry") {
-                            if let Some(wm_class) = group.0.get("StartupWMClass") {
-                                if wm_class.0.eq_ignore_ascii_case(&app_id_lower) {
-                                    return Some(path);
-                                }
-                            }
-                        }
+                    let is_wm_class_match = DesktopEntry::from_path(&path, None::<&[&str]>)
+                        .ok()
+                        .and_then(|entry| entry.groups.group("Desktop Entry").cloned())
+                        .and_then(|group| group.0.get("StartupWMClass").cloned())
+                        .is_some_and(|wm_class| wm_class.0.eq_ignore_ascii_case(&app_id_lower));
+
+                    if is_wm_class_match {
+                        return Some(path);
                     }
                 }
             }
@@ -275,14 +268,11 @@ pub fn find_desktop_file_path(app_id: &str) -> Option<PathBuf> {
 
 /// Reads the Name field from a desktop entry file.
 pub fn get_desktop_entry_name(path: &Path) -> Option<String> {
-    if let Ok(entry) = DesktopEntry::from_path(path, None::<&[&str]>) {
-        if let Some(group) = entry.groups.group("Desktop Entry") {
-            if let Some(name_tuple) = group.0.get("Name") {
-                return Some(name_tuple.0.clone());
-            }
-        }
-    }
-    None
+    DesktopEntry::from_path(path, None::<&[&str]>)
+        .ok()
+        .and_then(|entry| entry.groups.group("Desktop Entry").cloned())
+        .and_then(|group| group.0.get("Name").cloned())
+        .map(|name_tuple| name_tuple.0)
 }
 
 #[derive(Debug, Clone)]
@@ -328,10 +318,10 @@ pub fn load_niri_column_presets() -> Vec<ColumnPreset> {
                     }
                     // Clean trailing semicolons or braces
                     let clean_line = trimmed.trim_matches(|c| c == ';' || c == '{' || c == '}');
-                    let parts: Vec<&str> = clean_line.split_whitespace().collect();
-                    if parts.len() >= 2 {
-                        if parts[0] == "proportion" {
-                            let raw_val = parts[1].trim_matches(';');
+                    let mut parts = clean_line.split_whitespace();
+                    if let (Some(kind), Some(val_str)) = (parts.next(), parts.next()) {
+                        if kind == "proportion" {
+                            let raw_val = val_str.trim_matches(';');
                             if let Ok(val) = raw_val.parse::<f64>() {
                                 let pct = (val * 100.0).round() as u32;
                                 presets.push(ColumnPreset {
@@ -339,8 +329,8 @@ pub fn load_niri_column_presets() -> Vec<ColumnPreset> {
                                     change_spec: format!("{pct}%"),
                                 });
                             }
-                        } else if parts[0] == "fixed" {
-                            let raw_val = parts[1].trim_matches(';');
+                        } else if kind == "fixed" {
+                            let raw_val = val_str.trim_matches(';');
                             if let Ok(val) = raw_val.parse::<i32>() {
                                 presets.push(ColumnPreset {
                                     label: format!("{val}px"),
@@ -406,7 +396,7 @@ pub fn get_default_terminal_emulator() -> Option<String> {
                         continue;
                     }
                     let clean = trimmed.strip_suffix(".desktop").unwrap_or(trimmed);
-                    let binary = clean.split('.').last().unwrap_or(clean);
+                    let binary = clean.split('.').next_back().unwrap_or(clean);
                     if !binary.is_empty() {
                         return Some(binary.to_string());
                     }

@@ -117,34 +117,60 @@ pub enum HoverTarget {
     Window(u64),
 }
 
+#[derive(Default)]
+pub struct DragState {
+    pub item: Option<DraggedItem>,
+    pub start: cosmic::iced::Point,
+    pub has_moved: bool,
+    pub focused_before: bool,
+}
+
+#[derive(Default)]
+pub struct WidthSliderState {
+    pub dragging: HashMap<u64, u32>,
+}
+
+#[derive(Default)]
+pub struct ContextMenuState {
+    pub popup_id: Option<Id>,
+    pub target: Option<MenuTarget>,
+}
+
+#[derive(Default)]
+pub struct IconCache {
+    pub handles: HashMap<String, widget::icon::Handle>,
+    pub resolving: std::collections::HashSet<String>,
+}
+
 pub struct AppModel {
+    // ── Core ──────────────────────────────────────────────
     core: cosmic::Core,
     launcher: crate::launcher::SystemLauncher,
     action_tx: Option<cosmic::iced::futures::channel::mpsc::Sender<niri_ipc::Action>>,
+
+    // ── Niri Data ─────────────────────────────────────────
     raw_windows: HashMap<u64, Window>,
     raw_workspaces: HashMap<u64, Workspace>,
     raw_outputs: HashMap<String, Output>,
     column_presets: Vec<crate::utils::ColumnPreset>,
+    last_focused_window: Option<u64>,
+
+    // ── Pinned Apps ───────────────────────────────────────
     pinned: Vec<String>,
     desktop_info_cache: HashMap<String, DesktopAppInfo>,
-    app_icon_cache: HashMap<String, widget::icon::Handle>,
-    resolving_icons: std::collections::HashSet<String>,
-    dragging_column_width: HashMap<u64, u32>,
-    context_menu_id: Option<Id>,
-    last_scroll_time: Instant,
-    last_focused_window: Option<u64>,
+
+    // ── Grouped State ─────────────────────────────────────
+    icons: IconCache,
+    menu: ContextMenuState,
+    drag: DragState,
+    width_slider: WidthSliderState,
+
+    // ── UI ────────────────────────────────────────────────
     last_mouse_pos: cosmic::iced::Point,
+    last_scroll_time: Instant,
     hovered_target: Option<HoverTarget>,
-    context_menu_target: Option<MenuTarget>,
-    dragged_item: Option<DraggedItem>,
-    drag_start: cosmic::iced::Point,
-    width_debounce_version: u32,
-    pending_width_set: Option<(u64, String)>,
     show_workspace_name: bool,
     ignore_next_applet_right_click: bool,
-    has_drag_moved: bool,
-    focused_before_drag: bool,
-    is_width_debouncing: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -162,7 +188,7 @@ pub enum Message {
     CloseWindow(u64),
     SetColumnWidth(u64, String),
     ColumnWidthSliderChanged(u64, u32),
-    DebounceColumnWidth(u32),
+    ColumnWidthSliderReleased(u64),
     WorkspaceScrollDown,
     WorkspaceScrollUp,
     Surface(cosmic::surface::Action),
@@ -173,7 +199,7 @@ pub enum Message {
     MouseMove(cosmic::iced::Point),
     PinApp(String),
     UnpinApp(String),
-    LaunchApp(String),
+
     Hover(Option<HoverTarget>),
     NoOp,
     DragStart {
@@ -192,6 +218,7 @@ pub enum Message {
         target_workspace_id: u64,
         target: DragTarget,
     },
+    ClosePopupAndDrag,
 }
 
 /// Helper function to create the background style for button states.
@@ -225,7 +252,7 @@ fn icon_button_style(alpha: f32) -> cosmic::theme::Button {
 }
 
 /// Helper function to construct a vertical or horizontal divider with appropriate padding.
-fn make_divider<'a>(is_horizontal: bool, pad_x: f32, pad_y: f32) -> Element<'a, Message> {
+fn make_divider(is_horizontal: bool, pad_x: f32, pad_y: f32) -> Element<'static, Message> {
     if is_horizontal {
         cosmic::widget::container(cosmic::widget::divider::vertical::default())
             .padding([pad_y as u16, pad_x as u16])
@@ -264,28 +291,20 @@ impl cosmic::Application for AppModel {
             raw_workspaces: HashMap::new(),
             last_scroll_time: Instant::now(),
             action_tx: Some(tx),
-            app_icon_cache: HashMap::new(),
-            resolving_icons: std::collections::HashSet::new(),
             last_focused_window: None,
             show_workspace_name: false,
-            context_menu_id: None,
             last_mouse_pos: cosmic::iced::Point::default(),
             pinned: load_pinned(),
             desktop_info_cache: HashMap::new(),
             hovered_target: None,
-            context_menu_target: None,
             ignore_next_applet_right_click: false,
-            dragged_item: None,
-            has_drag_moved: false,
-            drag_start: cosmic::iced::Point::ORIGIN,
-            focused_before_drag: false,
             column_presets: crate::utils::load_niri_column_presets(),
             raw_outputs: HashMap::new(),
             launcher: crate::launcher::SystemLauncher::detect(),
-            dragging_column_width: HashMap::new(),
-            is_width_debouncing: false,
-            pending_width_set: None,
-            width_debounce_version: 0,
+            icons: IconCache::default(),
+            menu: ContextMenuState::default(),
+            drag: DragState::default(),
+            width_slider: WidthSliderState::default(),
         };
 
         // Fetch initial list of windows, workspaces, and outputs at startup
@@ -351,10 +370,10 @@ impl cosmic::Application for AppModel {
                                     conn_opt = None;
                                 }
                             }
-                            if let Some(conn2) = &mut conn_opt {
-                                if let Err(e) = conn2.push_request(Request::Action(action)).await {
-                                    log::error!("IPC action retry failed: {}", e);
-                                }
+                            if let Some(conn2) = &mut conn_opt
+                                && let Err(e) = conn2.push_request(Request::Action(action)).await
+                            {
+                                log::error!("IPC action retry failed: {}", e);
                             }
                         }
                     }
@@ -429,7 +448,7 @@ impl cosmic::Application for AppModel {
 
         let has_inactive_pinned = self.pinned.iter().any(|app_id| {
             !self.raw_windows.values().any(|w| {
-                w.app_id.as_ref().map_or(false, |id| {
+                w.app_id.as_ref().is_some_and(|id| {
                     id == app_id || &crate::utils::resolve_canonical_desktop_id(id) == app_id
                 })
             })
@@ -457,7 +476,7 @@ impl cosmic::Application for AppModel {
             let mut has_pinned = false;
             for (idx, app_id) in self.pinned.iter().enumerate() {
                 let is_open = self.raw_windows.values().any(|w| {
-                    w.app_id.as_ref().map_or(false, |id| {
+                    w.app_id.as_ref().is_some_and(|id| {
                         id == app_id || &crate::utils::resolve_canonical_desktop_id(id) == app_id
                     })
                 });
@@ -472,16 +491,16 @@ impl cosmic::Application for AppModel {
                     let opacity: f32 = if is_hovered { 1.0 } else { 0.5 };
                     let btn_alpha = 0.0;
 
-                    let icon_element: Element<'_, Self::Message> = match icon_handle.data.clone() {
+                    let icon_element: Element<'_, Self::Message> = match &icon_handle.data {
                         cosmic::widget::icon::Data::Image(image_handle) => {
-                            cosmic::iced::widget::Image::new(image_handle)
+                            cosmic::iced::widget::Image::new(image_handle.clone())
                                 .width(cosmic::iced::Length::Fixed(icon_f))
                                 .height(cosmic::iced::Length::Fixed(icon_f))
                                 .opacity(opacity)
                                 .into()
                         }
                         cosmic::widget::icon::Data::Svg(svg_handle) => {
-                            cosmic::iced::widget::Svg::<cosmic::Theme>::new(svg_handle)
+                            cosmic::iced::widget::Svg::<cosmic::Theme>::new(svg_handle.clone())
                                 .width(cosmic::iced::Length::Fixed(icon_f))
                                 .height(cosmic::iced::Length::Fixed(icon_f))
                                 .opacity(opacity)
@@ -557,11 +576,12 @@ impl cosmic::Application for AppModel {
                 is_first_ws = false;
 
                 if self.show_workspace_name {
-                    let label = workspace
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| workspace.idx.to_string());
-                    let label_widget = cosmic::iced::widget::text(label).size(wksp_label_size);
+                    let label_widget = if let Some(name) = &workspace.name {
+                        cosmic::iced::widget::text(name)
+                    } else {
+                        cosmic::iced::widget::text(workspace.idx.to_string())
+                    }
+                    .size(wksp_label_size);
 
                     let label_padding = if is_horizontal {
                         [0.0, divider_x_padding, 0.0, divider_x_padding]
@@ -765,7 +785,7 @@ impl cosmic::Application for AppModel {
                 }
             })
             .on_right_release(Message::RightClick(MenuTarget::Applet))
-            .on_move(|point| Message::MouseMove(point));
+            .on_move(Message::MouseMove);
 
         self.core.applet.autosize_window(applet_area).into()
     }
@@ -781,7 +801,7 @@ impl cosmic::Application for AppModel {
                 move |mut channel: cosmic::iced::futures::channel::mpsc::Sender<Message>| async move {
                     loop {
                         match Connection::make_connection().await {
-                            Ok(conn) => match conn.to_listener().await {
+                            Ok(conn) => match conn.into_listener().await {
                                 Ok(mut listener) => {
                                     log::debug!("Niri event stream connected");
                                     let mut buf = String::new();
@@ -804,28 +824,31 @@ impl cosmic::Application for AppModel {
             )
         });
 
-        let mouse_sub = cosmic::iced::event::listen_with(|event, _status, _window_id| {
-            if let cosmic::iced::Event::Mouse(cosmic::iced::mouse::Event::ButtonReleased(
-                cosmic::iced::mouse::Button::Left,
-            )) = event
-            {
-                Some(Message::DragEnd)
-            } else {
-                None
+        let global_sub = cosmic::iced::event::listen_with(|event, _status, _window_id| {
+            match event {
+                cosmic::iced::Event::Mouse(cosmic::iced::mouse::Event::ButtonReleased(
+                    cosmic::iced::mouse::Button::Left,
+                )) => Some(Message::DragEnd),
+                cosmic::iced::Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed { .. }) => {
+                    Some(Message::ClosePopupAndDrag)
+                }
+                _ => None,
             }
         });
 
-        Subscription::batch(vec![niri_sub, mouse_sub])
+        let subs = vec![niri_sub, global_sub];
+
+        Subscription::batch(subs)
     }
 
     fn update(&mut self, message: Self::Message) -> Task<cosmic::Action<Self::Message>> {
         match message {
             Message::InitialData { wins, wksps, outs } => {
                 self.raw_outputs = outs;
-                let our_output = self.core.applet.output_name.clone();
+                let our_output = &self.core.applet.output_name;
                 self.raw_workspaces = wksps
                     .into_iter()
-                    .filter(|ws| our_output.is_empty() || ws.output.as_deref() == Some(&our_output))
+                    .filter(|ws| our_output.is_empty() || ws.output.as_deref() == Some(our_output))
                     .map(|ws| (ws.id, ws))
                     .collect();
 
@@ -833,7 +856,7 @@ impl cosmic::Application for AppModel {
                     .into_iter()
                     .filter(|w| {
                         w.workspace_id
-                            .map_or(false, |ws_id| self.raw_workspaces.contains_key(&ws_id))
+                            .is_some_and(|ws_id| self.raw_workspaces.contains_key(&ws_id))
                     })
                     .map(|w| (w.id, w))
                     .collect();
@@ -849,8 +872,8 @@ impl cosmic::Application for AppModel {
                 return self.spawn_missing_icon_tasks();
             }
             Message::IconResolved { app_id, handle } => {
-                self.resolving_icons.remove(&app_id);
-                self.app_icon_cache.insert(app_id, handle);
+                self.icons.resolving.remove(&app_id);
+                self.icons.handles.insert(app_id, handle);
             }
             Message::NiriEvent(event) => return self.handle_niri_event(event),
             Message::CloseWindow(window_id) => {
@@ -859,118 +882,13 @@ impl cosmic::Application for AppModel {
                 });
             }
             Message::SetColumnWidth(window_id, change_spec) => {
-                self.send_action(Action::FocusWindow { id: window_id });
-                if change_spec == "100%" {
-                    self.send_action(Action::SetColumnWidth {
-                        change: niri_ipc::SizeChange::SetProportion(100.0),
-                    });
-                } else if let Some(pct_str) = change_spec.strip_suffix('%') {
-                    if let Ok(pct) = pct_str.parse::<f64>() {
-                        self.send_action(Action::SetColumnWidth {
-                            change: niri_ipc::SizeChange::SetProportion(pct),
-                        });
-                    }
-                } else if let Ok(px) = change_spec.parse::<i32>() {
-                    self.send_action(Action::SetColumnWidth {
-                        change: niri_ipc::SizeChange::SetFixed(px),
-                    });
-                }
+                self.handle_set_column_width(window_id, change_spec);
             }
             Message::ColumnWidthSliderChanged(window_id, val) => {
-                // Guard: reject spurious jumps caused by popup repositioning.
-                // When Niri resizes a window, the popup layout can shift, causing
-                // the slider widget to recalculate the cursor position against new
-                // bounds and fire on_change with a wildly wrong value.
-                if let Some(&prev) = self.dragging_column_width.get(&window_id) {
-                    let diff = (val as i32 - prev as i32).unsigned_abs();
-                    if diff > 30 {
-                        log::warn!(
-                            "Column width slider: rejected spurious jump from {}% to {}% (diff: {})",
-                            prev,
-                            val,
-                            diff
-                        );
-                        return Task::none();
-                    }
-                }
-
-                self.dragging_column_width.insert(window_id, val);
-
-                if !self.is_width_debouncing {
-                    // Send first event immediately (M1)
-                    log::info!(
-                        "Column width slider: sending immediate initial change (M1): {}%",
-                        val
-                    );
-                    self.is_width_debouncing = true;
-                    self.pending_width_set = None;
-                    self.send_action(Action::FocusWindow { id: window_id });
-                    self.send_action(Action::SetColumnWidth {
-                        change: niri_ipc::SizeChange::SetProportion(val as f64),
-                    });
-
-                    self.width_debounce_version += 1;
-                    let version = self.width_debounce_version;
-                    return Task::perform(
-                        async move {
-                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                            version
-                        },
-                        Message::DebounceColumnWidth,
-                    )
-                    .map(cosmic::Action::from);
-                } else {
-                    // Aggregate subsequent events in the buffer (M2, M3, ...)
-                    // Do NOT spawn a new timer or change version - let the existing 250ms periodic timer fire
-                    log::debug!(
-                        "Column width slider: aggregating update to buffer: {}%",
-                        val
-                    );
-                    self.pending_width_set = Some((window_id, format!("{}%", val)));
-                    return Task::none();
-                }
+                self.handle_column_width_slider_changed(window_id, val);
             }
-            Message::DebounceColumnWidth(version) => {
-                if version == self.width_debounce_version {
-                    // Send the aggregated value from the buffer (M2, M3, ...)
-                    if let Some((window_id, change_spec)) = self.pending_width_set.take() {
-                        log::info!(
-                            "Column width slider: sending periodic aggregated change: {}",
-                            change_spec
-                        );
-                        self.send_action(Action::FocusWindow { id: window_id });
-                        if let Some(pct_str) = change_spec.strip_suffix('%') {
-                            if let Ok(pct) = pct_str.parse::<f64>() {
-                                self.send_action(Action::SetColumnWidth {
-                                    change: niri_ipc::SizeChange::SetProportion(pct),
-                                });
-                            }
-                        } else if let Ok(px) = change_spec.parse::<i32>() {
-                            self.send_action(Action::SetColumnWidth {
-                                change: niri_ipc::SizeChange::SetFixed(px),
-                            });
-                        }
-
-                        // Spawn the next periodic 250ms timer since we are still actively dragging
-                        self.width_debounce_version += 1;
-                        let next_version = self.width_debounce_version;
-                        return Task::perform(
-                            async move {
-                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                                next_version
-                            },
-                            Message::DebounceColumnWidth,
-                        )
-                        .map(cosmic::Action::from);
-                    } else {
-                        // Dragging paused or stopped without release - stop the periodic timer
-                        log::debug!(
-                            "Column width slider: periodic timer expired with empty buffer, stopping"
-                        );
-                        self.is_width_debouncing = false;
-                    }
-                }
-                return Task::none();
+            Message::ColumnWidthSliderReleased(window_id) => {
+                self.handle_column_width_slider_released(window_id);
             }
             Message::WorkspaceScrollDown => {
                 if self.last_scroll_time.elapsed() >= std::time::Duration::from_millis(200) {
@@ -1002,118 +920,29 @@ impl cosmic::Application for AppModel {
             Message::RightClick(target) => return self.handle_right_click(target),
             Message::MouseMove(point) => {
                 self.last_mouse_pos = point;
-                if self.dragged_item.is_some() {
-                    if (point.x - self.drag_start.x).abs() > 6.0
-                        || (point.y - self.drag_start.y).abs() > 6.0
-                    {
-                        self.has_drag_moved = true;
-                    }
+                if self.drag.item.is_some()
+                    && ((point.x - self.drag.start.x).abs() > 6.0
+                        || (point.y - self.drag.start.y).abs() > 6.0)
+                {
+                    self.drag.has_moved = true;
                 }
             }
             Message::DragStart { app_id, index } => {
-                self.dragged_item = Some(DraggedItem::Pinned { app_id, index });
-                self.drag_start = self.last_mouse_pos;
-                self.has_drag_moved = false;
+                self.drag.item = Some(DraggedItem::Pinned { app_id, index });
+                self.drag.start = self.last_mouse_pos;
+                self.drag.has_moved = false;
             }
             Message::DragOver { index } => {
-                let dragged_info = match &self.dragged_item {
-                    Some(DraggedItem::Pinned { app_id, index }) => Some((app_id.clone(), *index)),
-                    _ => None,
-                };
-
-                if let Some((app_id, dragged_idx)) = dragged_info {
-                    if dragged_idx != index && index < self.pinned.len() {
-                        self.pinned.remove(dragged_idx);
-                        self.pinned.insert(index, app_id.clone());
-                        self.dragged_item = Some(DraggedItem::Pinned {
-                            app_id: app_id.clone(),
-                            index,
-                        });
-                        self.hovered_target = Some(HoverTarget::Pinned(app_id));
-                    }
-                } else if index < self.pinned.len() {
-                    let hovered_id = self.pinned[index].clone();
-                    self.hovered_target = Some(HoverTarget::Pinned(hovered_id));
-                }
+                self.handle_drag_over(index);
             }
             Message::DragEnd => {
-                if self.is_width_debouncing {
-                    // Mouse released - immediately flush any pending layout update
-                    if let Some((window_id, change_spec)) = self.pending_width_set.take() {
-                        log::info!(
-                            "Column width slider: mouse released, flushing final change immediately: {}",
-                            change_spec
-                        );
-                        self.send_action(Action::FocusWindow { id: window_id });
-                        if let Some(pct_str) = change_spec.strip_suffix('%') {
-                            if let Ok(pct) = pct_str.parse::<f64>() {
-                                self.send_action(Action::SetColumnWidth {
-                                    change: niri_ipc::SizeChange::SetProportion(pct),
-                                });
-                            }
-                        } else if let Ok(px) = change_spec.parse::<i32>() {
-                            self.send_action(Action::SetColumnWidth {
-                                change: niri_ipc::SizeChange::SetFixed(px),
-                            });
-                        }
-                    } else {
-                        log::debug!(
-                            "Column width slider: mouse released with empty buffer, no flush needed"
-                        );
-                    }
-                    self.is_width_debouncing = false;
-                    self.width_debounce_version += 1; // Invalidate any scheduled periodic timers
-                }
-
-                self.dragging_column_width.clear();
-
-                if let Some(item) = self.dragged_item.take() {
-                    match item {
-                        DraggedItem::Pinned { app_id, .. } => {
-                            if !self.has_drag_moved {
-                                self.has_drag_moved = false;
-                                return self.update(Message::LaunchApp(app_id));
-                            } else {
-                                self.has_drag_moved = false;
-                                return save_pinned_task(self.pinned.clone())
-                                    .map(cosmic::Action::from);
-                            }
-                        }
-                        DraggedItem::Window {
-                            window_id,
-                            workspace_id,
-                        } => {
-                            if !self.has_drag_moved {
-                                self.has_drag_moved = false;
-                                self.focus_or_center_window(
-                                    window_id,
-                                    workspace_id,
-                                    self.focused_before_drag,
-                                );
-                            }
-                        }
-                    }
-                }
-                self.has_drag_moved = false;
+                return self.handle_drag_end();
             }
             Message::WindowDragStart {
                 window_id,
                 workspace_id,
             } => {
-                self.dragged_item = Some(DraggedItem::Window {
-                    window_id,
-                    workspace_id,
-                });
-                self.drag_start = self.last_mouse_pos;
-                self.has_drag_moved = false;
-                self.focused_before_drag = self.last_focused_window == Some(window_id);
-                if !self.focused_before_drag {
-                    self.send_action(niri_ipc::Action::FocusWindow { id: window_id });
-                    self.last_focused_window = Some(window_id);
-                    if let Some(w) = self.raw_windows.get_mut(&window_id) {
-                        w.is_focused = true;
-                    }
-                }
+                self.handle_window_drag_start(window_id, workspace_id);
             }
             Message::WindowDragOver {
                 target_workspace_id,
@@ -1123,9 +952,21 @@ impl cosmic::Application for AppModel {
             }
             Message::PinApp(app_id) => return self.handle_pin_app(app_id),
             Message::UnpinApp(app_id) => return self.handle_unpin_app(app_id),
-            Message::LaunchApp(app_id) => self.handle_launch_app(&app_id),
+
             Message::Hover(target) => {
                 self.hovered_target = target;
+            }
+            Message::ClosePopupAndDrag => {
+                let mut tasks = vec![];
+                if let Some(task) = self.close_popup() {
+                    tasks.push(task);
+                }
+                
+                let window_ids: Vec<u64> = self.width_slider.dragging.keys().copied().collect();
+                for window_id in window_ids {
+                    self.handle_column_width_slider_released(window_id);
+                }
+                return Task::batch(tasks);
             }
             Message::NoOp => {}
         }
@@ -1138,20 +979,150 @@ impl cosmic::Application for AppModel {
 }
 
 impl AppModel {
+    fn handle_set_column_width(&mut self, window_id: u64, change_spec: String) {
+        let proportion = change_spec.ends_with('%');
+        let size_str = change_spec.trim_end_matches(|c: char| c.is_alphabetic() || c == '%');
+        if let Ok(size) = size_str.parse::<f64>() {
+            self.send_column_width_action(window_id, size, proportion);
+        } else {
+            log::warn!("Invalid width specifier: {}", change_spec);
+        }
+    }
+
+    fn handle_column_width_slider_changed(
+        &mut self,
+        window_id: u64,
+        val: u32,
+    ) {
+        let current_width = self
+            .width_slider
+            .dragging
+            .get(&window_id)
+            .copied()
+            .unwrap_or_else(|| self.calculate_window_width_pct(window_id));
+
+        if val.abs_diff(current_width) > 89 {
+            return;
+        }
+
+        self.width_slider.dragging.insert(window_id, val);
+        self.send_column_width_action(window_id, val as f64, true);
+    }
+
+    fn handle_column_width_slider_released(
+        &mut self,
+        window_id: u64,
+    ) {
+        if let Some(val) = self.width_slider.dragging.remove(&window_id) {
+            self.send_column_width_action(window_id, val as f64, true);
+        }
+    }
+
+    fn send_column_width_action(&mut self, window_id: u64, size: f64, proportion: bool) {
+        self.send_action(Action::FocusWindow { id: window_id });
+        if proportion {
+            self.send_action(Action::SetColumnWidth {
+                change: niri_ipc::SizeChange::SetProportion(size),
+            });
+        } else {
+            self.send_action(Action::SetColumnWidth {
+                change: niri_ipc::SizeChange::SetFixed(size as i32),
+            });
+        }
+    }
+
+    fn handle_drag_over(&mut self, index: usize) {
+        let dragged_info = match &self.drag.item {
+            Some(DraggedItem::Pinned { app_id, index }) => Some((app_id.clone(), *index)),
+            _ => None,
+        };
+
+        if let Some((app_id, dragged_idx)) = dragged_info {
+            if dragged_idx != index && index < self.pinned.len() {
+                self.pinned.remove(dragged_idx);
+                self.pinned.insert(index, app_id.clone());
+                self.drag.item = Some(DraggedItem::Pinned {
+                    app_id: app_id.clone(),
+                    index,
+                });
+                self.hovered_target = Some(HoverTarget::Pinned(app_id));
+            }
+        } else if index < self.pinned.len() {
+            let hovered_id = self.pinned[index].clone();
+            self.hovered_target = Some(HoverTarget::Pinned(hovered_id));
+        }
+    }
+
+    fn handle_drag_end(&mut self) -> Task<cosmic::Action<Message>> {
+        if let Some(item) = self.drag.item.take() {
+            match item {
+                DraggedItem::Pinned { app_id, .. } => {
+                    if !self.drag.has_moved {
+                        self.drag.has_moved = false;
+                        self.handle_launch_app(&app_id);
+                        return Task::none();
+                    } else {
+                        self.drag.has_moved = false;
+                        return save_pinned_task(self.pinned.clone()).map(cosmic::Action::from);
+                    }
+                }
+                DraggedItem::Window {
+                    window_id,
+                    workspace_id,
+                } => {
+                    if !self.drag.has_moved {
+                        self.drag.has_moved = false;
+                        self.focus_or_center_window(
+                            window_id,
+                            workspace_id,
+                            self.drag.focused_before,
+                        );
+                    }
+                }
+            }
+        }
+        self.drag.has_moved = false;
+        Task::none()
+    }
+
+    fn handle_window_drag_start(&mut self, window_id: u64, workspace_id: u64) {
+        self.drag.item = Some(DraggedItem::Window {
+            window_id,
+            workspace_id,
+        });
+        self.drag.start = self.last_mouse_pos;
+        self.drag.has_moved = false;
+        self.drag.focused_before = self.last_focused_window == Some(window_id);
+        if !self.drag.focused_before {
+            self.send_action(niri_ipc::Action::FocusWindow { id: window_id });
+            self.last_focused_window = Some(window_id);
+            if let Some(w) = self.raw_windows.get_mut(&window_id) {
+                w.is_focused = true;
+            }
+        }
+    }
+
     fn handle_niri_event(&mut self, event: Event) -> Task<cosmic::Action<Message>> {
         match event {
             Event::WorkspacesChanged { workspaces } => {
+                let our_output = &self.core.applet.output_name;
                 // Update raw_workspaces based on the complete list provided by Niri
-                self.raw_workspaces
-                    .retain(|id, _| workspaces.iter().any(|w| w.id == *id));
+                self.raw_workspaces.retain(|id, _| {
+                    workspaces.iter().any(|w| {
+                        w.id == *id
+                            && (our_output.is_empty() || w.output.as_deref() == Some(our_output))
+                    })
+                });
                 for ws in workspaces {
-                    if let Some(existing) = self.raw_workspaces.get_mut(&ws.id) {
-                        existing.idx = ws.idx;
-                        existing.name = ws.name.clone();
-                        existing.output = ws.output.clone();
-                        existing.active_window_id = ws.active_window_id;
-                    } else {
-                        self.raw_workspaces.insert(ws.id, ws.clone());
+                    if our_output.is_empty() || ws.output.as_deref() == Some(our_output) {
+                        if let Some(existing) = self.raw_workspaces.get_mut(&ws.id) {
+                            existing.idx = ws.idx;
+                            existing.name = ws.name.clone();
+                            existing.output = ws.output.clone();
+                            existing.active_window_id = ws.active_window_id;
+                        } else {
+                            self.raw_workspaces.insert(ws.id, ws.clone());
+                        }
                     }
                 }
                 fetch_outputs_async().map(cosmic::Action::from)
@@ -1174,7 +1145,7 @@ impl AppModel {
                     .into_iter()
                     .filter(|w| {
                         w.workspace_id
-                            .map_or(false, |ws_id| self.raw_workspaces.contains_key(&ws_id))
+                            .is_some_and(|ws_id| self.raw_workspaces.contains_key(&ws_id))
                     })
                     .map(|w| (w.id, w))
                     .collect();
@@ -1188,7 +1159,7 @@ impl AppModel {
 
                 if window
                     .workspace_id
-                    .map_or(false, |ws_id| self.raw_workspaces.contains_key(&ws_id))
+                    .is_some_and(|ws_id| self.raw_workspaces.contains_key(&ws_id))
                 {
                     self.raw_windows.insert(id, window);
                     if is_focused {
@@ -1196,27 +1167,25 @@ impl AppModel {
                     }
                     self.spawn_missing_icon_tasks()
                 } else {
-                    if self.raw_windows.remove(&id).is_some() {
-                        if self.last_focused_window == Some(id) {
-                            self.update_last_focused_window();
-                        }
+                    if self.raw_windows.remove(&id).is_some()
+                        && self.last_focused_window == Some(id)
+                    {
+                        self.update_last_focused_window();
                     }
                     Task::none()
                 }
             }
             Event::WindowClosed { id } => {
-                if self.raw_windows.remove(&id).is_some() {
-                    if self.last_focused_window == Some(id) {
-                        self.update_last_focused_window();
-                    }
+                if self.raw_windows.remove(&id).is_some() && self.last_focused_window == Some(id) {
+                    self.update_last_focused_window();
                 }
                 Task::none()
             }
             Event::WindowFocusChanged { id } => {
-                if let Some(focused_id) = id {
-                    if self.raw_windows.contains_key(&focused_id) {
-                        self.last_focused_window = Some(focused_id);
-                    }
+                if let Some(focused_id) = id
+                    && self.raw_windows.contains_key(&focused_id)
+                {
+                    self.last_focused_window = Some(focused_id);
                 }
                 Task::none()
             }
@@ -1260,18 +1229,21 @@ impl AppModel {
         let mut is_terminal = false;
         let mut cleaned_exec = None;
 
-        if let Some(ref path) = path_opt {
-            if let Ok(entry) =
+        if let Some(ref path) = path_opt
+            && let Ok(entry) =
                 freedesktop_desktop_entry::DesktopEntry::from_path(path, None::<&[&str]>)
-            {
-                is_terminal = entry.terminal();
-                cleaned_exec = entry.exec().map(|exec| {
-                    exec.split_whitespace()
-                        .filter(|arg| !arg.starts_with('%'))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                });
-            }
+        {
+            is_terminal = entry.terminal();
+            cleaned_exec = entry.exec().map(|exec| {
+                let mut result = String::new();
+                for arg in exec.split_whitespace().filter(|arg| !arg.starts_with('%')) {
+                    if !result.is_empty() {
+                        result.push(' ');
+                    }
+                    result.push_str(arg);
+                }
+                result
+            });
         }
 
         let cmd = self.launcher.build_command(
@@ -1337,80 +1309,80 @@ impl AppModel {
             DragTarget::Window(id) => Some(HoverTarget::Window(*id)),
             _ => None,
         };
-        let dragged_window_info = match &self.dragged_item {
+        let dragged_window_info = match &self.drag.item {
             Some(DraggedItem::Window {
                 window_id,
                 workspace_id,
             }) => Some((*window_id, *workspace_id)),
             _ => None,
         };
-        if let Some((window_id, current_ws_id)) = dragged_window_info {
-            if self.has_drag_moved {
-                if target_workspace_id != current_ws_id {
-                    let target_idx = self
-                        .raw_workspaces
-                        .get(&target_workspace_id)
-                        .map(|w| w.idx)
-                        .unwrap_or(0);
-                    self.send_action(Action::MoveWindowToWorkspace {
-                        window_id: Some(window_id),
-                        reference: niri_ipc::WorkspaceReferenceArg::Index(target_idx),
-                        focus: true,
-                    });
-                    self.send_action(Action::FocusWorkspace {
-                        reference: niri_ipc::WorkspaceReferenceArg::Index(target_idx),
-                    });
-                    self.send_action(Action::FocusWindow { id: window_id });
+        if let Some((window_id, current_ws_id)) = dragged_window_info
+            && self.drag.has_moved
+        {
+            if target_workspace_id != current_ws_id {
+                let target_idx = self
+                    .raw_workspaces
+                    .get(&target_workspace_id)
+                    .map(|w| w.idx)
+                    .unwrap_or(0);
+                self.send_action(Action::MoveWindowToWorkspace {
+                    window_id: Some(window_id),
+                    reference: niri_ipc::WorkspaceReferenceArg::Index(target_idx),
+                    focus: true,
+                });
+                self.send_action(Action::FocusWorkspace {
+                    reference: niri_ipc::WorkspaceReferenceArg::Index(target_idx),
+                });
+                self.send_action(Action::FocusWindow { id: window_id });
 
-                    if let Some(w) = self.raw_windows.get_mut(&window_id) {
-                        w.workspace_id = Some(target_workspace_id);
-                        w.is_focused = true;
+                if let Some(w) = self.raw_windows.get_mut(&window_id) {
+                    w.workspace_id = Some(target_workspace_id);
+                    w.is_focused = true;
+                }
+                for ws in self.raw_workspaces.values_mut() {
+                    if ws.id == target_workspace_id {
+                        ws.is_active = true;
+                        ws.is_focused = true;
+                    } else {
+                        ws.is_active = false;
+                        ws.is_focused = false;
                     }
-                    for ws in self.raw_workspaces.values_mut() {
-                        if ws.id == target_workspace_id {
-                            ws.is_active = true;
-                            ws.is_focused = true;
-                        } else {
-                            ws.is_active = false;
-                            ws.is_focused = false;
-                        }
+                }
+                self.last_focused_window = Some(window_id);
+                self.drag.item = Some(DraggedItem::Window {
+                    window_id,
+                    workspace_id: target_workspace_id,
+                });
+            } else {
+                match target {
+                    DragTarget::WorkspaceStart => {
+                        self.send_action(Action::MoveColumnToFirst {});
                     }
-                    self.last_focused_window = Some(window_id);
-                    self.dragged_item = Some(DraggedItem::Window {
-                        window_id,
-                        workspace_id: target_workspace_id,
-                    });
-                } else {
-                    match target {
-                        DragTarget::WorkspaceStart => {
-                            self.send_action(Action::MoveColumnToFirst {});
-                        }
-                        DragTarget::WorkspaceEnd => {
-                            self.send_action(Action::MoveColumnToLast {});
-                        }
-                        DragTarget::Window(t_win_id) => {
-                            if t_win_id != window_id {
-                                let mut ws_windows: Vec<&niri_ipc::Window> = self
-                                    .raw_windows
-                                    .values()
-                                    .filter(|w| {
-                                        w.workspace_id == Some(current_ws_id)
-                                            && w.app_id.as_deref()
-                                                != Some(<Self as cosmic::Application>::APP_ID)
-                                    })
-                                    .collect();
-                                ws_windows.sort_unstable_by_key(|w| {
-                                    w.layout
-                                        .pos_in_scrolling_layout
-                                        .unwrap_or((usize::MAX, usize::MAX))
+                    DragTarget::WorkspaceEnd => {
+                        self.send_action(Action::MoveColumnToLast {});
+                    }
+                    DragTarget::Window(t_win_id) => {
+                        if t_win_id != window_id {
+                            let mut ws_windows: Vec<&niri_ipc::Window> = self
+                                .raw_windows
+                                .values()
+                                .filter(|w| {
+                                    w.workspace_id == Some(current_ws_id)
+                                        && w.app_id.as_deref()
+                                            != Some(<Self as cosmic::Application>::APP_ID)
+                                })
+                                .collect();
+                            ws_windows.sort_unstable_by_key(|w| {
+                                w.layout
+                                    .pos_in_scrolling_layout
+                                    .unwrap_or((usize::MAX, usize::MAX))
+                            });
+                            if let Some(target_pos) =
+                                ws_windows.iter().position(|w| w.id == t_win_id)
+                            {
+                                self.send_action(Action::MoveColumnToIndex {
+                                    index: target_pos + 1,
                                 });
-                                if let Some(target_pos) =
-                                    ws_windows.iter().position(|w| w.id == t_win_id)
-                                {
-                                    self.send_action(Action::MoveColumnToIndex {
-                                        index: target_pos + 1,
-                                    });
-                                }
                             }
                         }
                     }
@@ -1436,17 +1408,17 @@ impl AppModel {
         if let Some(task) = self.close_popup() {
             Task::batch(vec![task, fetch_task])
         } else {
-            self.context_menu_target = Some(target);
+            self.menu.target = Some(target);
             Task::batch(vec![self.open_context_menu(), fetch_task])
         }
     }
 
     /// Retrieves or generates a fallback icon handle for the specified app_id.
     fn get_icon_handle(&self, app_id_opt: Option<&str>, icon_size: u16) -> widget::icon::Handle {
-        if let Some(app_id) = app_id_opt {
-            if let Some(handle) = self.app_icon_cache.get(app_id) {
-                return handle.clone();
-            }
+        if let Some(app_id) = app_id_opt
+            && let Some(handle) = self.icons.handles.get(app_id)
+        {
+            return handle.clone();
         }
         widget::icon::from_name("preferences-system-windows-symbolic")
             .symbolic(false)
@@ -1504,10 +1476,10 @@ impl AppModel {
         }
 
         for app_id_str in ids_to_resolve {
-            if !self.app_icon_cache.contains_key(&app_id_str)
-                && !self.resolving_icons.contains(&app_id_str)
+            if !self.icons.handles.contains_key(&app_id_str)
+                && !self.icons.resolving.contains(&app_id_str)
             {
-                self.resolving_icons.insert(app_id_str.clone());
+                self.icons.resolving.insert(app_id_str.clone());
                 tasks.push(
                     self.resolve_icon_async(app_id_str)
                         .map(cosmic::Action::from),
@@ -1521,9 +1493,121 @@ impl AppModel {
         }
     }
 
+    fn build_width_controls(&self, window_id: u64) -> Element<'_, Message> {
+        let current_width = self
+            .width_slider
+            .dragging
+            .get(&window_id)
+            .copied()
+            .unwrap_or_else(|| self.calculate_window_width_pct(window_id));
+
+        let width_label =
+            cosmic::iced::widget::text(format!("Column Width: {}%", current_width)).size(13);
+
+        let slider = cosmic::iced::widget::slider(10..=100, current_width, move |val| {
+            Message::ColumnWidthSliderChanged(window_id, val)
+        })
+        .on_release(Message::ColumnWidthSliderReleased(window_id))
+        .step(5u32)
+        .width(cosmic::iced::Length::Fill);
+
+        let mut width_row = Row::new().spacing(4);
+        let mut has_100_pct = false;
+
+        for preset in &self.column_presets {
+            if preset.label == "100%" {
+                has_100_pct = true;
+            }
+            let change_spec = preset.change_spec.clone();
+            let btn = widget::button::custom(cosmic::iced::widget::text(&preset.label).size(12))
+                .on_press(Message::SetColumnWidth(window_id, change_spec))
+                .padding([4, 8]);
+            width_row = width_row.push(btn);
+        }
+
+        if !has_100_pct {
+            let max_btn = widget::button::custom(cosmic::iced::widget::text("100%").size(12))
+                .on_press(Message::SetColumnWidth(window_id, "100%".to_string()))
+                .padding([4, 8]);
+            width_row = width_row.push(max_btn);
+        }
+
+        Column::new()
+            .spacing(8)
+            .push(width_label)
+            .push(slider)
+            .push(width_row)
+            .into()
+    }
+
+    fn build_window_menu(&self, window_id: u64, app_id: &Option<String>) -> Element<'_, Message> {
+        let mut content_col = Column::new().spacing(8);
+
+        // 1. Close window
+        let close_btn = widget::button::custom(widget::text("Close Window"))
+            .on_press(Message::CloseWindow(window_id))
+            .class(cosmic::theme::Button::Text)
+            .width(cosmic::iced::Length::Fill);
+        content_col = content_col.push(close_btn);
+        content_col = content_col.push(cosmic::widget::divider::horizontal::default());
+
+        // 2. Column Width Controls & Interactive Slider
+        content_col = content_col.push(self.build_width_controls(window_id));
+        content_col = content_col.push(cosmic::widget::divider::horizontal::default());
+
+        // 3. Pin window (Pin Application)
+        if let Some(app_id_str) = app_id {
+            let canonical = crate::utils::resolve_canonical_desktop_id(app_id_str);
+            let is_pinned = self.pinned.contains(&canonical);
+            let pin_action = if is_pinned {
+                Message::UnpinApp(canonical.clone())
+            } else {
+                Message::PinApp(canonical)
+            };
+
+            let pin_toggler = widget::toggler(is_pinned)
+                .label(Some("Pin Application".to_string()))
+                .width(cosmic::iced::Length::Fill)
+                .spacing(20.0)
+                .on_toggle(move |_| pin_action.clone());
+
+            content_col = content_col.push(pin_toggler);
+            content_col = content_col.push(cosmic::widget::divider::horizontal::default());
+        }
+
+        content_col.into()
+    }
+
+    fn build_pinned_menu(&self, app_id: &str) -> Element<'_, Message> {
+        let mut content_col = Column::new().spacing(8);
+        let app_id_clone = app_id.to_string();
+        let pin_toggler = widget::toggler(true)
+            .label(Some("Pin Application".to_string()))
+            .width(cosmic::iced::Length::Fill)
+            .spacing(20.0)
+            .on_toggle(move |_| Message::UnpinApp(app_id_clone.clone()));
+
+        content_col = content_col.push(pin_toggler);
+        content_col = content_col.push(cosmic::widget::divider::horizontal::default());
+        content_col.into()
+    }
+
+    fn build_applet_menu(&self) -> Element<'_, Message> {
+        let mut content_col = Column::new().spacing(8);
+        let target_window_id = self
+            .last_focused_window
+            .filter(|id| self.raw_windows.contains_key(id));
+
+        if let Some(window_id) = target_window_id {
+            content_col = content_col.push(self.build_width_controls(window_id));
+            content_col = content_col.push(cosmic::widget::divider::horizontal::default());
+        }
+        content_col.into()
+    }
+
     fn open_context_menu(&mut self) -> Task<cosmic::Action<Message>> {
         let popup_id = Id::unique();
-        self.context_menu_id = Some(popup_id);
+        self.menu.popup_id = Some(popup_id);
 
         let action = cosmic::surface::action::app_popup(
             |_app| cosmic::surface::action::LiveSettings::default(),
@@ -1544,7 +1628,11 @@ impl AppModel {
                 settings
             },
             Some(Box::new(move |app: &AppModel| {
-                let mut content_col = Column::new().spacing(8);
+                let target_content = match &app.menu.target {
+                    Some(MenuTarget::Window { id, app_id }) => app.build_window_menu(*id, app_id),
+                    Some(MenuTarget::Pinned { app_id }) => app.build_pinned_menu(app_id),
+                    _ => app.build_applet_menu(),
+                };
 
                 let name_toggler = widget::toggler(app.show_workspace_name)
                     .label(Some("Show workspace names".to_string()))
@@ -1552,173 +1640,10 @@ impl AppModel {
                     .spacing(20.0)
                     .on_toggle(Message::ToggleShowWorkspaceName);
 
-                let target_window_id = match &app.context_menu_target {
-                    Some(MenuTarget::Window { id, .. }) => Some(*id),
-                    _ => app
-                        .last_focused_window
-                        .filter(|id| app.raw_windows.contains_key(id)),
-                };
-
-                match &app.context_menu_target {
-                    Some(MenuTarget::Window { id, app_id }) => {
-                        let window_id = *id;
-
-                        // 1. Close window
-                        let close_btn = widget::button::custom(widget::text("Close Window"))
-                            .on_press(Message::CloseWindow(window_id))
-                            .class(cosmic::theme::Button::Text)
-                            .width(cosmic::iced::Length::Fill);
-                        content_col = content_col.push(close_btn);
-
-                        content_col =
-                            content_col.push(cosmic::widget::divider::horizontal::default());
-
-                        // 2. Column Width Controls & Interactive Slider (RIGHT BELOW Close Window)
-                        let current_width = app
-                            .dragging_column_width
-                            .get(&window_id)
-                            .copied()
-                            .unwrap_or_else(|| app.calculate_window_width_pct(window_id));
-                        let width_label =
-                            cosmic::iced::widget::text(format!("Column Width: {}%", current_width))
-                                .size(13);
-                        content_col = content_col.push(width_label);
-
-                        let slider =
-                            cosmic::iced::widget::slider(10..=100, current_width, move |val| {
-                                Message::ColumnWidthSliderChanged(window_id, val)
-                            })
-                            .step(5u32)
-                            .width(cosmic::iced::Length::Fill);
-
-                        content_col = content_col.push(slider);
-
-                        let mut width_row = Row::new().spacing(4);
-                        let mut has_100_pct = false;
-
-                        for preset in &app.column_presets {
-                            if preset.label == "100%" {
-                                has_100_pct = true;
-                            }
-                            let change_spec = preset.change_spec.clone();
-                            let btn = widget::button::custom(
-                                cosmic::iced::widget::text(preset.label.clone()).size(12),
-                            )
-                            .on_press(Message::SetColumnWidth(window_id, change_spec))
-                            .padding([4, 8]);
-                            width_row = width_row.push(btn);
-                        }
-
-                        if !has_100_pct {
-                            let max_btn =
-                                widget::button::custom(cosmic::iced::widget::text("100%").size(12))
-                                    .on_press(Message::SetColumnWidth(
-                                        window_id,
-                                        "100%".to_string(),
-                                    ))
-                                    .padding([4, 8]);
-                            width_row = width_row.push(max_btn);
-                        }
-
-                        content_col = content_col.push(width_row);
-
-                        content_col =
-                            content_col.push(cosmic::widget::divider::horizontal::default());
-
-                        // 3. Pin window (Pin Application)
-                        if let Some(app_id) = app_id {
-                            let canonical = crate::utils::resolve_canonical_desktop_id(app_id);
-                            let is_pinned =
-                                app.pinned.contains(app_id) || app.pinned.contains(&canonical);
-                            let pin_id = canonical.clone();
-                            let pin_action = if is_pinned {
-                                Message::UnpinApp(pin_id)
-                            } else {
-                                Message::PinApp(pin_id)
-                            };
-
-                            let pin_toggler = widget::toggler(is_pinned)
-                                .label(Some("Pin Application".to_string()))
-                                .width(cosmic::iced::Length::Fill)
-                                .spacing(20.0)
-                                .on_toggle(move |_| pin_action.clone());
-
-                            content_col = content_col.push(pin_toggler);
-
-                            content_col =
-                                content_col.push(cosmic::widget::divider::horizontal::default());
-                        }
-                    }
-                    Some(MenuTarget::Pinned { app_id }) => {
-                        let app_id_clone = app_id.clone();
-                        let pin_toggler = widget::toggler(true)
-                            .label(Some("Pin Application".to_string()))
-                            .width(cosmic::iced::Length::Fill)
-                            .spacing(20.0)
-                            .on_toggle(move |_| Message::UnpinApp(app_id_clone.clone()));
-
-                        content_col = content_col.push(pin_toggler);
-                        content_col =
-                            content_col.push(cosmic::widget::divider::horizontal::default());
-                    }
-                    _ => {
-                        if let Some(window_id) = target_window_id {
-                            let current_width = app
-                                .dragging_column_width
-                                .get(&window_id)
-                                .copied()
-                                .unwrap_or_else(|| app.calculate_window_width_pct(window_id));
-                            let width_label = cosmic::iced::widget::text(format!(
-                                "Column Width: {}%",
-                                current_width
-                            ))
-                            .size(13);
-                            content_col = content_col.push(width_label);
-
-                            let slider =
-                                cosmic::iced::widget::slider(10..=100, current_width, move |val| {
-                                    Message::ColumnWidthSliderChanged(window_id, val)
-                                })
-                                .step(5u32)
-                                .width(cosmic::iced::Length::Fill);
-
-                            content_col = content_col.push(slider);
-
-                            let mut width_row = Row::new().spacing(4);
-                            let mut has_100_pct = false;
-
-                            for preset in &app.column_presets {
-                                if preset.label == "100%" {
-                                    has_100_pct = true;
-                                }
-                                let change_spec = preset.change_spec.clone();
-                                let btn = widget::button::custom(
-                                    cosmic::iced::widget::text(preset.label.clone()).size(12),
-                                )
-                                .on_press(Message::SetColumnWidth(window_id, change_spec))
-                                .padding([4, 8]);
-                                width_row = width_row.push(btn);
-                            }
-
-                            if !has_100_pct {
-                                let max_btn = widget::button::custom(
-                                    cosmic::iced::widget::text("100%").size(12),
-                                )
-                                .on_press(Message::SetColumnWidth(window_id, "100%".to_string()))
-                                .padding([4, 8]);
-                                width_row = width_row.push(max_btn);
-                            }
-
-                            content_col = content_col.push(width_row);
-
-                            content_col =
-                                content_col.push(cosmic::widget::divider::horizontal::default());
-                        }
-                    }
-                }
-
-                // 3. Show workspace names
-                content_col = content_col.push(name_toggler);
+                let content_col = Column::new()
+                    .spacing(8)
+                    .push(target_content)
+                    .push(name_toggler);
 
                 let padded = cosmic::widget::container(content_col).padding(16);
                 let popup_content = app.core.applet.popup_container(padded);
@@ -1746,8 +1671,8 @@ impl AppModel {
     }
 
     fn close_popup(&mut self) -> Option<Task<cosmic::Action<Message>>> {
-        self.context_menu_id.take().map(|popup_id| {
-            self.context_menu_target = None;
+        self.menu.popup_id.take().map(|popup_id| {
+            self.menu.target = None;
             Task::done(cosmic::Action::Cosmic(cosmic::app::Action::Surface(
                 cosmic::surface::action::destroy_popup(popup_id),
             )))
@@ -1756,13 +1681,13 @@ impl AppModel {
 
     fn pre_cache_pinned_desktop_paths(&mut self) {
         for app_id in &self.pinned {
-            if !self.desktop_info_cache.contains_key(app_id) {
-                if let Some(path) = crate::utils::find_desktop_file_path(app_id) {
-                    let name = crate::utils::get_desktop_entry_name(&path)
-                        .unwrap_or_else(|| app_id.clone());
-                    self.desktop_info_cache
-                        .insert(app_id.clone(), DesktopAppInfo { path, name });
-                }
+            if !self.desktop_info_cache.contains_key(app_id)
+                && let Some(path) = crate::utils::find_desktop_file_path(app_id)
+            {
+                let name =
+                    crate::utils::get_desktop_entry_name(&path).unwrap_or_else(|| app_id.clone());
+                self.desktop_info_cache
+                    .insert(app_id.clone(), DesktopAppInfo { path, name });
             }
         }
     }
@@ -1827,12 +1752,11 @@ impl AppModel {
 fn fetch_outputs_async() -> Task<Message> {
     Task::perform(
         async {
-            if let Ok(mut conn) = Connection::make_connection().await {
-                if let Ok(Reply::Ok(Response::Outputs(o))) =
+            if let Ok(mut conn) = Connection::make_connection().await
+                && let Ok(Reply::Ok(Response::Outputs(o))) =
                     conn.push_request(Request::Outputs).await
-                {
-                    return Some(o);
-                }
+            {
+                return Some(o);
             }
             None
         },
