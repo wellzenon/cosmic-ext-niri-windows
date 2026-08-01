@@ -16,7 +16,7 @@ https://github.com/user-attachments/assets/7fec42dc-a27e-4169-ab17-7553a277453a
 - **Context Menu**:
   - **Show workspace names**: Toggle workspace name labels.
   - **Close Application**: Closes target window.
-  - **Column Width**: Dynamic column width presets based on Niri's `config.kdl` steps.
+  - **Column Width**: Dynamic column width presets based on Nir 's `config.kdl` steps.
   - **Pin Application**: Toggle pinned shortcuts for favorite apps.
 
 

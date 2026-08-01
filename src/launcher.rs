@@ -172,12 +172,15 @@ impl SystemLauncher {
             vec!["sh".to_string(), "-c".to_string(), format!("exec '{app_id}'")]
         };
 
-        if self.is_flatpak {
+        let final_cmd = if self.is_flatpak {
             let mut flatpak_cmd = vec!["flatpak-spawn".to_string(), "--host".to_string()];
             flatpak_cmd.extend(raw_cmd);
             flatpak_cmd
         } else {
             raw_cmd
-        }
+        };
+
+        log::debug!("Launch command for '{}': {:?}", app_id, final_cmd);
+        final_cmd
     }
 }

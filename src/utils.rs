@@ -380,6 +380,7 @@ pub fn load_niri_column_presets() -> Vec<ColumnPreset> {
             unique_presets.push(p);
         }
     }
+    log::debug!("Loaded {} column presets from niri config", unique_presets.len());
     unique_presets
 }
 

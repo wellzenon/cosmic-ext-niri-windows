@@ -34,6 +34,7 @@ test target="native":
     #!/usr/bin/env bash
     if [ "{{target}}" = "native" ]; then
         echo "==> Installing and testing NATIVE build in COSMIC panel..."
+        just build native
         just install
         pkill -x cosmic-panel || true
         sleep 1.2

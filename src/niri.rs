@@ -14,10 +14,13 @@ impl Connection {
         if let Some(path) = std::env::var_os(SOCKET_PATH_ENV) {
             let path_buf = std::path::PathBuf::from(&path);
             match UnixStream::connect(&path_buf).await {
-                Ok(s) => return Ok(Self(s)),
+                Ok(s) => {
+                    log::debug!("Connected to Niri IPC via NIRI_SOCKET={}", path_buf.display());
+                    return Ok(Self(s));
+                }
                 Err(e) => {
-                    eprintln!(
-                        "COSMIC Niri: NIRI_SOCKET={} exists but connection failed: {}",
+                    log::warn!(
+                        "NIRI_SOCKET={} exists but connection failed: {}",
                         path_buf.display(),
                         e
                     );
@@ -62,10 +65,13 @@ impl Connection {
 
             for (path, _) in &candidates {
                 match UnixStream::connect(path).await {
-                    Ok(s) => return Ok(Self(s)),
+                    Ok(s) => {
+                        log::debug!("Connected to Niri IPC via scanned socket {}", path.display());
+                        return Ok(Self(s));
+                    }
                     Err(e) => {
-                        eprintln!(
-                            "COSMIC Niri: Found socket {} but connection failed: {}",
+                        log::warn!(
+                            "Found socket {} but connection failed: {}",
                             path.display(),
                             e
                         );
@@ -76,11 +82,15 @@ impl Connection {
 
         Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!(
-                "Could not connect to any Niri IPC socket. NIRI_SOCKET={:?}, XDG_RUNTIME_DIR={}",
-                std::env::var_os(SOCKET_PATH_ENV),
-                runtime_dir.display()
-            ),
+            {
+                let msg = format!(
+                    "Could not connect to any Niri IPC socket. NIRI_SOCKET={:?}, XDG_RUNTIME_DIR={}",
+                    std::env::var_os(SOCKET_PATH_ENV),
+                    runtime_dir.display()
+                );
+                log::error!("{}", msg);
+                msg
+            },
         ))
     }
 
@@ -111,9 +121,12 @@ impl Listener {
     pub async fn next_event(&mut self, buf: &mut String) -> io::Result<Option<Event>> {
         self.0.read_line(buf).await?;
         match serde_json::from_str(buf) {
-            Ok(e) => Ok(Some(e)),
+            Ok(e) => {
+                log::trace!("Niri IPC event received: {:?}", e);
+                Ok(Some(e))
+            }
             Err(_) => {
-                // Silently ignore new or unhandled Niri IPC event variants (e.g., CastsChanged)
+                log::debug!("Ignoring unknown Niri IPC event: {}", buf.trim());
                 Ok(None)
             }
         }

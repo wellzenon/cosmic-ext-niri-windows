@@ -4,8 +4,10 @@ mod app;
 mod niri;
 
 fn main() -> cosmic::iced::Result {
-    // Initialize standard logging
-    env_logger::init();
+    // Initialize standard logging with default level for our crate
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("cosmic_ext_niri_windows=info")
+    ).init();
 
     // Start the COSMIC Applet event loop
     cosmic::applet::run::<app::AppModel>(())
