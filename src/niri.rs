@@ -122,7 +122,13 @@ pub struct Listener(BufReader<UnixStream>);
 
 impl Listener {
     pub async fn next_event(&mut self, buf: &mut String) -> io::Result<Option<Event>> {
-        self.0.read_line(buf).await?;
+        let n = self.0.read_line(buf).await?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Connection closed",
+            ));
+        }
         match serde_json::from_str(buf) {
             Ok(e) => {
                 log::trace!("Niri IPC event received: {:?}", e);

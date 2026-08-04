@@ -1465,19 +1465,21 @@ impl AppModel {
                     icon_name
                 };
 
-                let handle: widget::icon::Handle = if icon_name_clean.starts_with('/')
-                    || std::path::Path::new(&icon_name_clean).exists()
-                {
-                    widget::icon::from_path(std::path::PathBuf::from(icon_name_clean))
-                } else if let Some(path_str) =
-                    crate::utils::resolve_icon_name_to_path(&icon_name_clean)
-                {
-                    widget::icon::from_path(std::path::PathBuf::from(path_str))
-                } else {
-                    widget::icon::from_name(icon_name_clean)
-                        .symbolic(false)
-                        .into()
-                };
+                // Desktop-entry Icon values are either absolute paths or icon
+                // names. A name must not be interpreted relative to the applet's
+                // working directory (for example, Icon=obsidian and ~/obsidian).
+                let handle: widget::icon::Handle =
+                    if std::path::Path::new(&icon_name_clean).is_absolute() {
+                        widget::icon::from_path(std::path::PathBuf::from(icon_name_clean))
+                    } else if let Some(path_str) =
+                        crate::utils::resolve_icon_name_to_path(&icon_name_clean)
+                    {
+                        widget::icon::from_path(std::path::PathBuf::from(path_str))
+                    } else {
+                        widget::icon::from_name(icon_name_clean)
+                            .symbolic(false)
+                            .into()
+                    };
 
                 (app_id_str, handle)
             },
