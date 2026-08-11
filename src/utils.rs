@@ -1,34 +1,61 @@
 use freedesktop_desktop_entry::DesktopEntry;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 static CURRENT_ICON_THEME: OnceLock<Option<String>> = OnceLock::new();
+static DESKTOP_PATH_CACHE: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
+static ICON_PATH_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+static APPLICATION_DIRS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+static DESKTOP_FILES_BY_DIR: OnceLock<Mutex<HashMap<PathBuf, Vec<PathBuf>>>> = OnceLock::new();
+static STARTUP_WM_CLASS_CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<String>>>> = OnceLock::new();
+const MAX_LOOKUP_CACHE_ENTRIES: usize = 2048;
 
 /// Standard application desktop entry directories.
-fn get_application_dirs() -> Vec<PathBuf> {
-    let mut dirs = vec![
-        PathBuf::from("/usr/share/applications"),
-        PathBuf::from("/usr/local/share/applications"),
-        PathBuf::from("/run/host/usr/share/applications"),
-        PathBuf::from("/run/host/share/applications"),
-    ];
+fn get_application_dirs() -> &'static [PathBuf] {
+    APPLICATION_DIRS
+        .get_or_init(|| {
+            let mut dirs = vec![
+                PathBuf::from("/usr/share/applications"),
+                PathBuf::from("/usr/local/share/applications"),
+                PathBuf::from("/run/host/usr/share/applications"),
+                PathBuf::from("/run/host/share/applications"),
+            ];
 
-    if let Some(home_dir) = dirs::home_dir() {
-        dirs.push(home_dir.join(".local/share/applications"));
-        dirs.push(home_dir.join(".local/share/flatpak/exports/share/applications"));
-    }
+            if let Some(home_dir) = dirs::home_dir() {
+                dirs.push(home_dir.join(".local/share/applications"));
+                dirs.push(home_dir.join(".local/share/flatpak/exports/share/applications"));
+            }
 
-    if let Some(d) = dirs::data_dir() {
-        dirs.push(d.join("applications"));
-        dirs.push(d.join("flatpak/exports/share/applications"));
-    }
+            if let Some(d) = dirs::data_dir() {
+                dirs.push(d.join("applications"));
+                dirs.push(d.join("flatpak/exports/share/applications"));
+            }
 
-    dirs.push(PathBuf::from("/var/lib/flatpak/exports/share/applications"));
-    dirs
+            dirs.push(PathBuf::from("/var/lib/flatpak/exports/share/applications"));
+            dirs
+        })
+        .as_slice()
 }
 
 pub fn resolve_icon_name_to_path(icon_name: &str) -> Option<String> {
+    let cache = ICON_PATH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(cached) = cache.lock().ok()?.get(icon_name).cloned() {
+        return cached;
+    }
+
+    let result = resolve_icon_name_to_path_uncached(icon_name);
+    if let Ok(mut entries) = cache.lock() {
+        if entries.len() >= MAX_LOOKUP_CACHE_ENTRIES {
+            entries.clear();
+        }
+        entries.insert(icon_name.to_owned(), result.clone());
+    }
+    result
+}
+
+fn resolve_icon_name_to_path_uncached(icon_name: &str) -> Option<String> {
     if icon_name.is_empty() {
         return None;
     }
@@ -95,7 +122,7 @@ pub fn resolve_icon_name_to_path(icon_name: &str) -> Option<String> {
             }
             let theme_dir = dir.join(&theme);
             if theme_dir.exists()
-                && let Some(found_path) = search_in_dir_recursive(&theme_dir, &target_names, 0, 5)
+                && let Some(found_path) = find_common_icon_path(&theme_dir, &target_names)
             {
                 return Some(found_path.to_string_lossy().into_owned());
             }
@@ -109,23 +136,41 @@ pub fn resolve_icon_name_to_path(icon_name: &str) -> Option<String> {
         }
         let hicolor_dir = dir.join("hicolor");
         if hicolor_dir.exists()
-            && let Some(found_path) = search_in_dir_recursive(&hicolor_dir, &target_names, 0, 5)
+            && let Some(found_path) = find_common_icon_path(&hicolor_dir, &target_names)
         {
             return Some(found_path.to_string_lossy().into_owned());
         }
     }
 
-    // 4. Search other directories recursively (limiting depth to prevent long delays)
-    for dir in &search_dirs {
-        if !dir.exists() || dir.ends_with("pixmaps") {
-            continue;
-        }
-        if let Some(found_path) = search_in_dir_recursive(dir, &target_names, 0, 5) {
-            return Some(found_path.to_string_lossy().into_owned());
+    // Do not recursively scan every installed theme. Apart from being expensive,
+    // that would select an arbitrary icon from an inactive theme. The active theme
+    // and hicolor fallback above are the freedesktop lookup contract.
+    None
+}
+
+fn find_common_icon_path(dir: &Path, target_names: &[String]) -> Option<PathBuf> {
+    const COMMON_ICON_DIRS: &[&str] = &[
+        "apps/scalable",
+        "scalable/apps",
+        "apps/128x128",
+        "apps/64x64",
+        "apps/48x48",
+        "apps/32x32",
+        "apps/24x24",
+        "apps/22x22",
+        "apps/16x16",
+    ];
+
+    for relative in COMMON_ICON_DIRS {
+        let candidate_dir = dir.join(relative);
+        for target in target_names {
+            let candidate = candidate_dir.join(target);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
-
-    None
+    search_in_dir_recursive(dir, target_names, 0, 5)
 }
 
 /// Retrieves the user's currently configured GTK icon theme name.
@@ -205,6 +250,12 @@ pub fn find_fallback_icon(app_id: &str) -> Option<String> {
 }
 /// Resolves the canonical desktop entry ID (e.g. "org.neovim.nvim") for a given running app_id (e.g. "nvim").
 pub fn resolve_canonical_desktop_id(app_id: &str) -> String {
+    // Browser web-app IDs identify a distinct desktop entry. Resolving them
+    // through StartupWMClass would collapse them into the parent browser and
+    // cause session restore to launch a normal browser window instead.
+    if app_id.to_ascii_lowercase().contains("webapp") {
+        return app_id.to_string();
+    }
     if let Some(desktop_path) = find_desktop_file_path(app_id)
         && let Some(stem) = desktop_path.file_stem().and_then(|s| s.to_str())
     {
@@ -215,6 +266,22 @@ pub fn resolve_canonical_desktop_id(app_id: &str) -> String {
 
 /// Searches desktop files to retrieve the absolute path for a given app_id.
 pub fn find_desktop_file_path(app_id: &str) -> Option<PathBuf> {
+    let cache = DESKTOP_PATH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(cached) = cache.lock().ok()?.get(app_id).cloned() {
+        return cached;
+    }
+
+    let result = find_desktop_file_path_uncached(app_id);
+    if let Ok(mut entries) = cache.lock() {
+        if entries.len() >= MAX_LOOKUP_CACHE_ENTRIES {
+            entries.clear();
+        }
+        entries.insert(app_id.to_owned(), result.clone());
+    }
+    result
+}
+
+fn find_desktop_file_path_uncached(app_id: &str) -> Option<PathBuf> {
     let dirs = get_application_dirs();
     let app_id_lower = app_id.to_lowercase();
     let dot_app_id_desktop = format!(".{}.desktop", app_id_lower);
@@ -231,7 +298,7 @@ pub fn find_desktop_file_path(app_id: &str) -> Option<PathBuf> {
         search_names.push(format!("{}.desktop", last_part.to_lowercase()));
     }
 
-    for dir in &dirs {
+    for dir in dirs {
         if !dir.exists() {
             continue;
         }
@@ -245,37 +312,71 @@ pub fn find_desktop_file_path(app_id: &str) -> Option<PathBuf> {
         }
 
         // Single-pass directory scan for fuzzy filename match & StartupWMClass match
-        if let Ok(entries) = fs::read_dir(dir) {
-            for e in entries.flatten() {
-                if let Ok(file_name) = e.file_name().into_string() {
-                    let file_name_lower = file_name.to_lowercase();
-                    if !file_name_lower.ends_with(".desktop") {
-                        continue;
-                    }
+        for path in desktop_files_in_dir(dir) {
+            if let Some(file_name) = path.file_name().and_then(|name| name.to_str()) {
+                let file_name_lower = file_name.to_lowercase();
+                if !file_name_lower.ends_with(".desktop") {
+                    continue;
+                }
 
-                    // 1. Check fuzzy filename match
-                    if file_name_lower.starts_with(&app_id_lower)
-                        || file_name_lower.ends_with(&dot_app_id_desktop)
-                    {
-                        return Some(e.path());
-                    }
+                // 1. Check fuzzy filename match
+                if file_name_lower.starts_with(&app_id_lower)
+                    || file_name_lower.ends_with(&dot_app_id_desktop)
+                {
+                    return Some(path);
+                }
 
-                    // 2. Check StartupWMClass match
-                    let path = e.path();
-                    let is_wm_class_match = DesktopEntry::from_path(&path, None::<&[&str]>)
-                        .ok()
-                        .and_then(|entry| entry.groups.group("Desktop Entry").cloned())
-                        .and_then(|group| group.0.get("StartupWMClass").cloned())
-                        .is_some_and(|wm_class| wm_class.0.eq_ignore_ascii_case(&app_id_lower));
+                // 2. Check StartupWMClass match
+                let startup_wm_class =
+                    STARTUP_WM_CLASS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+                let wm_class = if let Ok(mut cache) = startup_wm_class.lock() {
+                    cache
+                        .entry(path.clone())
+                        .or_insert_with(|| {
+                            DesktopEntry::from_path(&path, None::<&[&str]>)
+                                .ok()
+                                .and_then(|entry| entry.groups.group("Desktop Entry").cloned())
+                                .and_then(|group| group.0.get("StartupWMClass").cloned())
+                                .map(|value| value.0)
+                        })
+                        .clone()
+                } else {
+                    None
+                };
+                let is_wm_class_match = wm_class
+                    .as_deref()
+                    .is_some_and(|value| value.eq_ignore_ascii_case(&app_id_lower));
 
-                    if is_wm_class_match {
-                        return Some(path);
-                    }
+                if is_wm_class_match {
+                    return Some(path);
                 }
             }
         }
     }
     None
+}
+
+fn desktop_files_in_dir(dir: &Path) -> Vec<PathBuf> {
+    let cache = DESKTOP_FILES_BY_DIR.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(entries) = cache.lock()
+        && let Some(paths) = entries.get(dir)
+    {
+        return paths.clone();
+    }
+
+    let paths = fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "desktop"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if let Ok(mut entries) = cache.lock() {
+        entries.insert(dir.to_owned(), paths.clone());
+    }
+    paths
 }
 
 /// Reads the Name field from a desktop entry file.
@@ -461,4 +562,51 @@ pub fn get_default_terminal_emulator() -> Option<String> {
     }
 
     None
+}
+
+/// Formats an RFC 3339 timestamp relative to a supplied instant.
+///
+/// Supplying `now` keeps this function deterministic and lets callers choose
+/// when the displayed age should be refreshed.
+pub fn format_relative_time(value: &str, now: jiff::Timestamp) -> String {
+    let Ok(timestamp) = value.parse::<jiff::Timestamp>() else {
+        return value.to_string();
+    };
+    let seconds = now.as_second().saturating_sub(timestamp.as_second()).max(0) as u64;
+    match seconds {
+        0..60 => "just now".to_string(),
+        60..3_600 => format!("{} min ago", seconds / 60),
+        3_600..86_400 => format!("{}h ago", seconds / 3_600),
+        86_400..2_592_000 => {
+            let days = seconds / 86_400;
+            format!("{days} day{} ago", if days == 1 { "" } else { "s" })
+        }
+        2_592_000..31_536_000 => {
+            let months = seconds / 2_592_000;
+            format!("{months} month{} ago", if months == 1 { "" } else { "s" })
+        }
+        _ => {
+            let years = seconds / 31_536_000;
+            format!("{years} year{} ago", if years == 1 { "" } else { "s" })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_relative_time;
+
+    #[test]
+    fn relative_time_uses_compact_units() {
+        let now: jiff::Timestamp = "2026-08-11T12:00:00Z".parse().unwrap();
+        assert_eq!(
+            format_relative_time("2026-08-11T11:59:00Z", now),
+            "1 min ago"
+        );
+        assert_eq!(format_relative_time("2026-08-11T10:00:00Z", now), "2h ago");
+        assert_eq!(
+            format_relative_time("2026-08-09T12:00:00Z", now),
+            "2 days ago"
+        );
+    }
 }

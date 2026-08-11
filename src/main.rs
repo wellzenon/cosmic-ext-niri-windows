@@ -1,6 +1,8 @@
 mod app;
+mod config;
 mod launcher;
 mod niri;
+mod session;
 mod utils;
 
 fn main() -> cosmic::iced::Result {

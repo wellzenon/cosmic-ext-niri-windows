@@ -25,40 +25,6 @@ pub fn binary_exists(name: &str) -> bool {
     false
 }
 
-/// Helper to construct terminal emulator command line with app_id / WM_CLASS override flags.
-pub fn build_terminal_command(term: &str, app_id: &str, exec_str: &str) -> String {
-    let term_binary = term.split_whitespace().next().unwrap_or(term);
-    let term_lower = term_binary.to_lowercase();
-    let term_name = Path::new(&term_lower)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(&term_lower);
-
-    match term_name {
-        "foot" | "footclient" => {
-            format!("'{term}' -a '{app_id}' -e {exec_str}")
-        }
-        "alacritty" => {
-            format!("'{term}' --class '{app_id}' -e {exec_str}")
-        }
-        "kitty" => {
-            format!("'{term}' --class '{app_id}' {exec_str}")
-        }
-        "ghostty" => {
-            format!("'{term}' --class='{app_id}' -e {exec_str}")
-        }
-        "cosmic-term" => {
-            format!("'{term}' --app-id='{app_id}' -e {exec_str}")
-        }
-        "wezterm" => {
-            format!("'{term}' start --class '{app_id}' -- {exec_str}")
-        }
-        _ => {
-            format!("'{term}' -e {exec_str}")
-        }
-    }
-}
-
 /// Cached system launcher capabilities for application dispatching.
 #[derive(Debug, Clone)]
 pub struct SystemLauncher {
@@ -91,122 +57,100 @@ impl SystemLauncher {
         launcher
     }
 
-    /// Constructs the appropriate execution command vector for a target desktop app or app_id.
-    pub fn build_command(
+    /// Builds a direct argv vector. No user-controlled value is passed through a shell.
+    pub fn build_command_with_args(
         &self,
         app_id: &str,
         desktop_path: Option<&Path>,
         is_terminal: bool,
-        cleaned_exec: Option<&str>,
+        exec_args: Option<&[String]>,
     ) -> Vec<String> {
         let path_str_opt = desktop_path.map(|p| p.to_string_lossy().to_string());
+        let fallback_args = || {
+            exec_args
+                .filter(|args| !args.is_empty())
+                .map_or_else(|| vec![app_id.to_string()], ToOwned::to_owned)
+        };
 
         let raw_cmd = if is_terminal {
-            let exec_str = cleaned_exec.unwrap_or(app_id);
             if let Some(ref term) = self.default_terminal {
-                let term_cmd = build_terminal_command(term, app_id, exec_str);
+                let mut term_cmd = term
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                if term_cmd.is_empty() {
+                    return fallback_args();
+                }
+                let term_name = Path::new(&term_cmd[0])
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(&term_cmd[0])
+                    .to_ascii_lowercase();
+                match term_name.as_str() {
+                    "foot" | "footclient" => {
+                        term_cmd.extend(["-a".into(), app_id.into(), "-e".into()])
+                    }
+                    "alacritty" => term_cmd.extend(["--class".into(), app_id.into(), "-e".into()]),
+                    "kitty" => term_cmd.extend(["--class".into(), app_id.into()]),
+                    "ghostty" => term_cmd.extend([format!("--class={app_id}"), "-e".into()]),
+                    "cosmic-term" => term_cmd.extend([format!("--app-id={app_id}"), "-e".into()]),
+                    "wezterm" => term_cmd.extend([
+                        "start".into(),
+                        "--class".into(),
+                        app_id.into(),
+                        "--".into(),
+                    ]),
+                    _ => term_cmd.push("-e".into()),
+                }
+                term_cmd.extend(fallback_args());
                 if self.has_uwsm {
-                    vec![
-                        "sh".to_string(),
-                        "-c".to_string(),
-                        format!("exec uwsm app -- {term_cmd}"),
-                    ]
+                    let mut command = vec!["uwsm".to_string(), "app".to_string(), "--".to_string()];
+                    command.extend(term_cmd);
+                    command
                 } else {
-                    vec![
-                        "sh".to_string(),
-                        "-c".to_string(),
-                        format!("exec {term_cmd}"),
-                    ]
+                    term_cmd
                 }
             } else if self.has_uwsm {
                 if let Some(ref path_str) = path_str_opt {
-                    vec![
-                        "sh".to_string(),
-                        "-c".to_string(),
-                        format!("exec uwsm app -- '{path_str}'"),
-                    ]
+                    vec!["uwsm".into(), "app".into(), "--".into(), path_str.clone()]
                 } else {
-                    vec![
-                        "uwsm".to_string(),
-                        "app".to_string(),
-                        "--".to_string(),
-                        app_id.to_string(),
-                    ]
+                    let mut command = vec!["uwsm".into(), "app".into(), "--".into()];
+                    command.extend(fallback_args());
+                    command
                 }
             } else if self.has_gtk_launch {
-                vec!["gtk-launch".to_string(), app_id.to_string()]
+                vec!["gtk-launch".into(), app_id.to_string()]
             } else if self.has_gio {
                 if let Some(ref path_str) = path_str_opt {
-                    vec!["gio".to_string(), "launch".to_string(), path_str.clone()]
+                    vec!["gio".into(), "launch".into(), path_str.clone()]
                 } else {
-                    vec![
-                        "sh".to_string(),
-                        "-c".to_string(),
-                        format!("exec '{exec_str}'"),
-                    ]
+                    fallback_args()
                 }
             } else {
-                vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    format!("exec '{exec_str}'"),
-                ]
+                fallback_args()
             }
         } else if self.has_uwsm {
             if let Some(ref path_str) = path_str_opt {
-                vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    format!("exec uwsm app -- '{path_str}'"),
-                ]
+                vec!["uwsm".into(), "app".into(), "--".into(), path_str.clone()]
             } else {
-                vec![
-                    "uwsm".to_string(),
-                    "app".to_string(),
-                    "--".to_string(),
-                    app_id.to_string(),
-                ]
+                let mut command = vec!["uwsm".into(), "app".into(), "--".into()];
+                command.extend(fallback_args());
+                command
             }
         } else if self.has_gtk_launch {
-            vec!["gtk-launch".to_string(), app_id.to_string()]
+            vec!["gtk-launch".into(), app_id.to_string()]
         } else if self.has_gio {
             if let Some(ref path_str) = path_str_opt {
-                vec!["gio".to_string(), "launch".to_string(), path_str.clone()]
+                vec!["gio".into(), "launch".into(), path_str.clone()]
             } else {
-                vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    format!("exec '{app_id}'"),
-                ]
+                fallback_args()
             }
-        } else if let Some(exec) = cleaned_exec {
-            if !exec.is_empty() {
-                vec!["sh".to_string(), "-c".to_string(), format!("exec {exec}")]
-            } else if let Some(ref path_str) = path_str_opt {
-                vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    format!("exec '{path_str}'"),
-                ]
-            } else {
-                vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    format!("exec '{app_id}'"),
-                ]
-            }
+        } else if exec_args.is_some_and(|args| !args.is_empty()) {
+            fallback_args()
         } else if let Some(ref path_str) = path_str_opt {
-            vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                format!("exec '{path_str}'"),
-            ]
+            vec![path_str.clone()]
         } else {
-            vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                format!("exec '{app_id}'"),
-            ]
+            fallback_args()
         };
 
         let final_cmd = if self.is_flatpak {

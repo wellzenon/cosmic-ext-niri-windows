@@ -46,15 +46,12 @@ cargo install --git https://github.com/wellzenon/cosmic-ext-niri-windows
 This project uses `just` for workflow automation.
 
 ```bash
-# Build native binary
-just build
+# Validate formatting, lints and tests
+just verify
 
-# Test in COSMIC panel
+# Build, install and test in COSMIC panel
 just test
 
-# Install locally to ~/.local/bin
-just install
-
-# Restart panel to apply changes
-just restart-panel
+# Create Flatpak, native and AUR release artifacts
+just bundle
 ```
