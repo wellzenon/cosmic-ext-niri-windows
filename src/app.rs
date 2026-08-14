@@ -1,6 +1,12 @@
+use crate::applications::app_ids_equivalent;
 use crate::config::AppConfig;
+use crate::layout::{
+    ColumnWidthSpec, SizeSpec, column_width_percentage, inferred_working_extent,
+    is_significant_extent_change, snapshot_size,
+};
 use crate::niri::{Connection, Event};
 use crate::session::{OutputSnapshot, SessionSnapshot, WindowSnapshot, WorkspaceSnapshot};
+use crate::ui::{divider as make_divider, icon_button_style};
 use cosmic::iced::futures::SinkExt;
 use cosmic::iced::widget::{Column, Row};
 use cosmic::iced::{Subscription, Task, window::Id};
@@ -106,9 +112,23 @@ pub struct ContextMenuState {
     pub snapshot_age: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct WindowSizeModes {
+    width: Option<SizeSpec>,
+    height: Option<SizeSpec>,
+}
+
+#[derive(Default)]
+struct OutputMetrics {
+    max_column_width: f64,
+    column_heights: HashMap<(u64, usize), f64>,
+}
+
 pub struct IconCache {
     pub handles: HashMap<String, widget::icon::Handle>,
     pub resolving: HashSet<String>,
+    theme: String,
+    generation: u64,
     resolver_limit: Arc<tokio::sync::Semaphore>,
 }
 
@@ -117,10 +137,29 @@ impl Default for IconCache {
         Self {
             handles: HashMap::new(),
             resolving: HashSet::new(),
+            theme: cosmic::config::icon_theme(),
+            generation: 0,
             // Icon themes can contain thousands of files. Avoid monopolizing the
             // runtime when many windows appear at once.
             resolver_limit: Arc::new(tokio::sync::Semaphore::new(2)),
         }
+    }
+}
+
+impl IconCache {
+    fn switch_theme(&mut self, theme: String) -> bool {
+        if self.theme == theme {
+            return false;
+        }
+        self.theme = theme;
+        self.generation = self.generation.wrapping_add(1);
+        self.handles.clear();
+        self.resolving.clear();
+        true
+    }
+
+    fn accepts(&self, generation: u64) -> bool {
+        self.generation == generation
     }
 }
 
@@ -137,7 +176,9 @@ pub struct AppModel {
     ordered_workspace_ids: Vec<u64>,
     windows_by_workspace: HashMap<u64, Vec<u64>>,
     open_app_ids: HashSet<String>,
-    column_presets: Vec<crate::utils::ColumnPreset>,
+    column_presets: Vec<crate::niri_config::ColumnPreset>,
+    window_size_modes: HashMap<u64, WindowSizeModes>,
+    output_refresh_pending: bool,
     last_focused_window: Option<u64>,
 
     // ── Pinned Apps ───────────────────────────────────────
@@ -181,16 +222,18 @@ pub enum Message {
     IconResolved {
         app_id: String,
         handle: widget::icon::Handle,
+        generation: u64,
     },
+    IconThemeChanged(String),
     CloseWindow(u64),
-    SetColumnWidth(u64, String),
+    SetColumnWidth(u64, ColumnWidthSpec),
     ColumnWidthSliderChanged(u64, u32),
     ColumnWidthSliderReleased(u64),
     WorkspaceScrollDown,
     WorkspaceScrollUp,
     Surface(cosmic::surface::Action),
     Error(String),
-    OutputsUpdated(HashMap<String, Output>),
+    OutputsRefreshFinished(Option<HashMap<String, Output>>),
     ToggleShowWorkspaceName(bool),
     ToggleSessionPersistence(bool),
     ToggleFixedSnapshot(bool),
@@ -227,67 +270,6 @@ pub enum Message {
     ClosePopupAndDrag,
 }
 
-/// Helper function to create the background style for button states.
-fn create_button_style(theme: &cosmic::Theme, alpha: f32) -> cosmic::widget::button::Style {
-    let cosmic = theme.cosmic();
-    let mut style = cosmic::widget::button::Style::new();
-    if alpha > 0.0 {
-        style.background = Some(cosmic::iced::Background::Color(cosmic::iced::Color {
-            a: alpha,
-            ..cosmic.accent_color().into()
-        }));
-        style.border_radius = cosmic.corner_radii.radius_s.into();
-    }
-    style
-}
-
-/// Helper function to create custom button style for applet icons with specified alpha opacity.
-fn icon_button_style(alpha: f32) -> cosmic::theme::Button {
-    cosmic::theme::Button::Custom {
-        active: Box::new(move |_focused, theme| create_button_style(theme, alpha)),
-        disabled: Box::new(move |theme| create_button_style(theme, alpha)),
-        hovered: Box::new(move |_focused, theme| {
-            let h_alpha = (alpha + 0.10).clamp(0.20, 0.50);
-            create_button_style(theme, h_alpha)
-        }),
-        pressed: Box::new(move |_focused, theme| {
-            let p_alpha = (alpha + 0.20).clamp(0.30, 0.60);
-            create_button_style(theme, p_alpha)
-        }),
-    }
-}
-
-/// Helper function to construct a vertical or horizontal divider with appropriate padding.
-fn make_divider(is_horizontal: bool, pad_x: f32, pad_y: f32) -> Element<'static, Message> {
-    if is_horizontal {
-        cosmic::widget::container(cosmic::widget::divider::vertical::default())
-            .padding([pad_y as u16, pad_x as u16])
-            .into()
-    } else {
-        cosmic::widget::container(cosmic::widget::divider::horizontal::default())
-            .padding([pad_x as u16, pad_y as u16])
-            .into()
-    }
-}
-
-fn restore_app_ids_match(left: &str, right: &str) -> bool {
-    if left == right {
-        return true;
-    }
-    left.split_once("webapp-")
-        .zip(right.split_once("webapp-"))
-        .is_some_and(|((_, left_id), (_, right_id))| left_id == right_id)
-}
-
-fn scaled_restore_dimension(value: f64, saved_extent: Option<u32>, current_extent: u32) -> f64 {
-    let Some(saved_extent) = saved_extent.filter(|extent| *extent > 0) else {
-        return value;
-    };
-    (value * f64::from(current_extent) / f64::from(saved_extent))
-        .round()
-        .clamp(1.0, f64::from(current_extent))
-}
-
 impl cosmic::Application for AppModel {
     type Executor = cosmic::executor::Default;
     type Flags = ();
@@ -315,8 +297,15 @@ impl cosmic::Application for AppModel {
                 AppConfig::default()
             }
         };
-        let loaded_session = crate::session::session_path()
-            .and_then(|path| crate::session::load_from(&path).ok().flatten());
+        let loaded_session = crate::session::session_path().and_then(|path| {
+            match crate::session::load_from(&path) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    log::warn!("Could not load Niri session: {error}");
+                    None
+                }
+            }
+        });
         let session_enabled = config.session_enabled;
         let show_workspace_names = config.show_workspace_names;
         let write_initial_config = crate::config::config_path()
@@ -337,7 +326,9 @@ impl cosmic::Application for AppModel {
             canonical_app_ids: HashMap::new(),
             hovered_target: None,
             ignore_next_applet_right_click: false,
-            column_presets: crate::utils::load_niri_column_presets(),
+            column_presets: crate::niri_config::load_column_presets(),
+            window_size_modes: HashMap::new(),
+            output_refresh_pending: false,
             raw_outputs: HashMap::new(),
             ordered_workspace_ids: Vec::new(),
             windows_by_workspace: HashMap::new(),
@@ -889,7 +880,12 @@ impl cosmic::Application for AppModel {
                 _ => None,
             });
 
-        let subs = vec![niri_sub, global_sub];
+        let icon_theme_sub = self
+            .core
+            .watch_config::<cosmic::config::CosmicTk>(cosmic::config::ID)
+            .map(|update| Message::IconThemeChanged(update.config.icon_theme));
+
+        let subs = vec![niri_sub, global_sub, icon_theme_sub];
 
         Subscription::batch(subs)
     }
@@ -931,9 +927,23 @@ impl cosmic::Application for AppModel {
                 let restore_task = self.begin_session_restore();
                 return Task::batch(vec![icon_task, restore_task]);
             }
-            Message::IconResolved { app_id, handle } => {
-                self.icons.resolving.remove(&app_id);
-                self.icons.handles.insert(app_id, handle);
+            Message::IconResolved {
+                app_id,
+                handle,
+                generation,
+            } => {
+                if self.icons.accepts(generation) {
+                    self.icons.resolving.remove(&app_id);
+                    self.icons.handles.insert(app_id, handle);
+                }
+            }
+            Message::IconThemeChanged(theme) => {
+                if self.icons.switch_theme(theme.clone()) {
+                    log::info!("Icon theme changed to '{theme}', refreshing app icons");
+                    cosmic::icon_theme::set_default(theme);
+                    crate::icons::clear_icon_path_cache();
+                    return self.spawn_missing_icon_tasks();
+                }
             }
             Message::NiriEvent(event) => return self.handle_niri_event(event),
             Message::CloseWindow(window_id) => {
@@ -941,8 +951,8 @@ impl cosmic::Application for AppModel {
                     id: Some(window_id),
                 });
             }
-            Message::SetColumnWidth(window_id, change_spec) => {
-                self.handle_set_column_width(window_id, change_spec);
+            Message::SetColumnWidth(window_id, width) => {
+                self.handle_set_column_width(window_id, width);
             }
             Message::ColumnWidthSliderChanged(window_id, val) => {
                 self.handle_column_width_slider_changed(window_id, val);
@@ -968,8 +978,11 @@ impl cosmic::Application for AppModel {
             Message::Error(err) => {
                 log::error!("{}", err);
             }
-            Message::OutputsUpdated(outs) => {
-                self.raw_outputs = outs;
+            Message::OutputsRefreshFinished(outputs) => {
+                self.output_refresh_pending = false;
+                if let Some(outputs) = outputs {
+                    self.update_outputs(outputs);
+                }
             }
             Message::ToggleShowWorkspaceName(val) => {
                 self.show_workspace_name = val;
@@ -1154,14 +1167,8 @@ impl cosmic::Application for AppModel {
 }
 
 impl AppModel {
-    fn handle_set_column_width(&mut self, window_id: u64, change_spec: String) {
-        let proportion = change_spec.ends_with('%');
-        let size_str = change_spec.trim_end_matches(|c: char| c.is_alphabetic() || c == '%');
-        if let Ok(size) = size_str.parse::<f64>() {
-            self.send_column_width_action(window_id, size, proportion);
-        } else {
-            log::warn!("Invalid width specifier: {}", change_spec);
-        }
+    fn handle_set_column_width(&mut self, window_id: u64, width: ColumnWidthSpec) {
+        self.send_column_width_action(window_id, width);
     }
 
     fn handle_column_width_slider_changed(&mut self, window_id: u64, val: u32) {
@@ -1177,25 +1184,58 @@ impl AppModel {
         }
 
         self.width_slider.dragging.insert(window_id, val);
-        self.send_column_width_action(window_id, val as f64, true);
+        self.send_column_width_action(
+            window_id,
+            ColumnWidthSpec::Proportion(f64::from(val) / 100.0),
+        );
     }
 
     fn handle_column_width_slider_released(&mut self, window_id: u64) {
         if let Some(val) = self.width_slider.dragging.remove(&window_id) {
-            self.send_column_width_action(window_id, val as f64, true);
+            self.send_column_width_action(
+                window_id,
+                ColumnWidthSpec::Proportion(f64::from(val) / 100.0),
+            );
         }
     }
 
-    fn send_column_width_action(&mut self, window_id: u64, size: f64, proportion: bool) {
+    fn send_column_width_action(&mut self, window_id: u64, width: ColumnWidthSpec) {
+        let size = SizeSpec::from(width);
+        let Some(change) = size.to_niri_size_change() else {
+            log::warn!("Ignoring invalid column width: {width:?}");
+            return;
+        };
+        self.record_column_width_mode(window_id, size);
         self.send_action(Action::FocusWindow { id: window_id });
-        if proportion {
-            self.send_action(Action::SetColumnWidth {
-                change: niri_ipc::SizeChange::SetProportion(size),
-            });
+        self.send_action(Action::SetColumnWidth { change });
+    }
+
+    fn record_column_width_mode(&mut self, window_id: u64, size: SizeSpec) {
+        let Some(target) = self.raw_windows.get(&window_id) else {
+            return;
+        };
+        let target_column = target
+            .layout
+            .pos_in_scrolling_layout
+            .map(|(column, _)| column);
+        let target_workspace = target.workspace_id;
+        let affected_ids: Vec<u64> = if let Some(target_column) = target_column {
+            self.raw_windows
+                .values()
+                .filter(|window| {
+                    window.workspace_id == target_workspace
+                        && window
+                            .layout
+                            .pos_in_scrolling_layout
+                            .is_some_and(|(column, _)| column == target_column)
+                })
+                .map(|window| window.id)
+                .collect()
         } else {
-            self.send_action(Action::SetColumnWidth {
-                change: niri_ipc::SizeChange::SetFixed(size as i32),
-            });
+            vec![window_id]
+        };
+        for id in affected_ids {
+            self.window_size_modes.entry(id).or_default().width = Some(size);
         }
     }
 
@@ -1299,6 +1339,7 @@ impl AppModel {
                         .workspace_id
                         .is_some_and(|id| self.raw_workspaces.contains_key(&id))
                 });
+                self.prune_window_size_modes();
                 self.rebuild_workspace_order();
                 self.rebuild_window_index();
                 self.with_session_save(Task::none())
@@ -1329,6 +1370,7 @@ impl AppModel {
                     self.normalize_window_app_id(window);
                 }
                 self.raw_windows = raw_windows;
+                self.prune_window_size_modes();
                 self.rebuild_window_index();
 
                 self.update_last_focused_window();
@@ -1373,6 +1415,7 @@ impl AppModel {
                     self.with_session_save(icon_task)
                 } else {
                     self.raw_windows.remove(&id);
+                    self.window_size_modes.remove(&id);
                     if self.last_focused_window == Some(id) {
                         self.update_last_focused_window();
                     }
@@ -1387,6 +1430,7 @@ impl AppModel {
             }
             Event::WindowClosed { id } => {
                 let old_window = self.raw_windows.remove(&id);
+                self.window_size_modes.remove(&id);
                 if old_window.is_some() && self.last_focused_window == Some(id) {
                     self.update_last_focused_window();
                 }
@@ -1424,6 +1468,19 @@ impl AppModel {
                 Task::none()
             }
             Event::WindowLayoutsChanged { changes, .. } => {
+                let output_may_have_changed = !self.restoring_session
+                    && changes.iter().any(|(id, new_layout)| {
+                        self.raw_windows.get(id).is_some_and(|window| {
+                            self.window_size_modes
+                                .get(id)
+                                .and_then(|modes| modes.width)
+                                .is_some_and(|size| matches!(size, SizeSpec::Proportion(_)))
+                                && is_significant_extent_change(
+                                    window.layout.tile_size.0,
+                                    new_layout.tile_size.0,
+                                )
+                        })
+                    });
                 for (id, new_layout) in changes {
                     if let Some(w) = self.raw_windows.get_mut(&id) {
                         w.layout = new_layout;
@@ -1432,9 +1489,14 @@ impl AppModel {
                 // Window order is derived from `pos_in_scrolling_layout`. Keep the
                 // render index synchronized with live drag/reorder events.
                 self.rebuild_window_index();
-                self.with_session_save(Task::none())
+                let refresh_task = if output_may_have_changed {
+                    self.refresh_outputs()
+                } else {
+                    Task::none()
+                };
+                self.with_session_save(refresh_task)
             }
-            Event::ConfigLoaded { .. } => fetch_outputs_async().map(cosmic::Action::from),
+            Event::ConfigLoaded { .. } => self.refresh_outputs(),
             _ => Task::none(),
         }
     }
@@ -1442,9 +1504,9 @@ impl AppModel {
     fn handle_launch_app(&mut self, app_id: &str) {
         let path_opt = if let Some(info) = self.desktop_info_cache.get(app_id) {
             Some(info.path.clone())
-        } else if let Some(path) = crate::utils::find_desktop_file_path(app_id) {
-            let name =
-                crate::utils::get_desktop_entry_name(&path).unwrap_or_else(|| app_id.to_string());
+        } else if let Some(path) = crate::applications::find_desktop_file_path(app_id) {
+            let name = crate::applications::get_desktop_entry_name(&path)
+                .unwrap_or_else(|| app_id.to_string());
             self.desktop_info_cache.insert(
                 app_id.to_string(),
                 DesktopAppInfo {
@@ -1485,8 +1547,8 @@ impl AppModel {
             self.config.pinned = self.pinned.clone();
             let save_task = save_config_task(self.config.clone());
 
-            if let Some(path) = crate::utils::find_desktop_file_path(&canonical_id) {
-                let name = crate::utils::get_desktop_entry_name(&path)
+            if let Some(path) = crate::applications::find_desktop_file_path(&canonical_id) {
+                let name = crate::applications::get_desktop_entry_name(&path)
                     .unwrap_or_else(|| canonical_id.clone());
                 self.desktop_info_cache
                     .insert(canonical_id, DesktopAppInfo { path, name });
@@ -1638,7 +1700,7 @@ impl AppModel {
                     .fixed_snapshot_enabled_at
                     .as_deref()
                     .map(|timestamp| {
-                        crate::utils::format_relative_time(timestamp, jiff::Timestamp::now())
+                        crate::ui::format_relative_time(timestamp, jiff::Timestamp::now())
                     })
             } else {
                 None
@@ -1663,6 +1725,8 @@ impl AppModel {
 
     fn resolve_icon_async(&self, app_id_str: String) -> Task<Message> {
         let resolver_limit = Arc::clone(&self.icons.resolver_limit);
+        let theme = self.icons.theme.clone();
+        let generation = self.icons.generation;
         Task::perform(
             async move {
                 let _permit = resolver_limit
@@ -1671,7 +1735,7 @@ impl AppModel {
                     .expect("icon resolver semaphore is never closed");
                 let lookup_id = app_id_str.clone();
                 let handle = tokio::task::spawn_blocking(move || {
-                    let icon_name = crate::utils::find_fallback_icon(&lookup_id)
+                    let icon_name = crate::icons::find_fallback_icon(&lookup_id, &theme)
                         .unwrap_or_else(|| lookup_id.clone());
                     let icon_name_clean = if icon_name.starts_with("file://") {
                         icon_name.trim_start_matches("file://").to_string()
@@ -1685,7 +1749,7 @@ impl AppModel {
                     if std::path::Path::new(&icon_name_clean).is_absolute() {
                         widget::icon::from_path(std::path::PathBuf::from(icon_name_clean))
                     } else if let Some(path_str) =
-                        crate::utils::resolve_icon_name_to_path(&icon_name_clean)
+                        crate::icons::resolve_icon_name_to_path(&icon_name_clean, &theme)
                     {
                         widget::icon::from_path(std::path::PathBuf::from(path_str))
                     } else {
@@ -1702,9 +1766,13 @@ impl AppModel {
                         .into()
                 });
 
-                (app_id_str, handle)
+                (app_id_str, handle, generation)
             },
-            |(app_id, handle)| Message::IconResolved { app_id, handle },
+            |(app_id, handle, generation)| Message::IconResolved {
+                app_id,
+                handle,
+                generation,
+            },
         )
     }
 
@@ -1768,16 +1836,19 @@ impl AppModel {
             if preset.label == "100%" {
                 has_100_pct = true;
             }
-            let change_spec = preset.change_spec.clone();
+            let width = preset.width;
             let btn = widget::button::custom(cosmic::iced::widget::text(&preset.label).size(12))
-                .on_press(Message::SetColumnWidth(window_id, change_spec))
+                .on_press(Message::SetColumnWidth(window_id, width))
                 .padding([4, 8]);
             width_row = width_row.push(btn);
         }
 
         if !has_100_pct {
             let max_btn = widget::button::custom(cosmic::iced::widget::text("100%").size(12))
-                .on_press(Message::SetColumnWidth(window_id, "100%".to_string()))
+                .on_press(Message::SetColumnWidth(
+                    window_id,
+                    ColumnWidthSpec::Proportion(1.0),
+                ))
                 .padding([4, 8]);
             width_row = width_row.push(max_btn);
         }
@@ -1947,6 +2018,59 @@ impl AppModel {
     }
 
     fn capture_session(&self) -> SessionSnapshot {
+        let mut output_metrics: HashMap<Option<String>, OutputMetrics> = HashMap::new();
+        for workspace_id in &self.ordered_workspace_ids {
+            let Some(workspace) = self.raw_workspaces.get(workspace_id) else {
+                continue;
+            };
+            let metrics = output_metrics.entry(workspace.output.clone()).or_default();
+            let Some(window_ids) = self.windows_by_workspace.get(workspace_id) else {
+                continue;
+            };
+            for window_id in window_ids {
+                let Some(window) = self.raw_windows.get(window_id) else {
+                    continue;
+                };
+                if window.is_floating {
+                    continue;
+                }
+                let Some((column, _)) = window.layout.pos_in_scrolling_layout else {
+                    continue;
+                };
+                metrics.max_column_width = metrics.max_column_width.max(window.layout.tile_size.0);
+                *metrics
+                    .column_heights
+                    .entry((workspace.id, column))
+                    .or_default() += window.layout.tile_size.1;
+            }
+        }
+
+        let working_extents: HashMap<Option<String>, (Option<f64>, Option<f64>)> = output_metrics
+            .iter()
+            .map(|(output_name, metrics)| {
+                let logical_size = output_name
+                    .as_deref()
+                    .and_then(|name| self.raw_outputs.get(name))
+                    .and_then(|output| output.logical.as_ref())
+                    .map(|logical| (logical.width, logical.height));
+                let max_column_height =
+                    metrics.column_heights.values().copied().fold(0.0, f64::max);
+                (
+                    output_name.clone(),
+                    (
+                        inferred_working_extent(
+                            logical_size.map(|(width, _)| width),
+                            metrics.max_column_width,
+                        ),
+                        inferred_working_extent(
+                            logical_size.map(|(_, height)| height),
+                            max_column_height,
+                        ),
+                    ),
+                )
+            })
+            .collect();
+
         let mut outputs: Vec<OutputSnapshot> = Vec::new();
         for workspace_id in &self.ordered_workspace_ids {
             let Some(workspace) = self.raw_workspaces.get(workspace_id) else {
@@ -1983,14 +2107,33 @@ impl AppModel {
                         continue;
                     };
                     let (column, tile) = window.layout.pos_in_scrolling_layout.unwrap_or((1, 1));
+                    let known_modes = self
+                        .window_size_modes
+                        .get(window_id)
+                        .copied()
+                        .unwrap_or_default();
+                    let (working_width, working_height) = working_extents
+                        .get(&workspace.output)
+                        .copied()
+                        .unwrap_or((None, None));
                     workspace_snapshot.windows.push(WindowSnapshot {
                         app_id,
                         column,
                         tile,
                         floating: window.is_floating,
                         focused: self.last_focused_window == Some(window.id),
-                        width: window.layout.tile_size.0,
-                        height: window.layout.tile_size.1,
+                        width: snapshot_size(
+                            known_modes.width,
+                            window.is_floating,
+                            window.layout.tile_size.0,
+                            working_width,
+                        ),
+                        height: snapshot_size(
+                            known_modes.height,
+                            window.is_floating,
+                            window.layout.tile_size.1,
+                            working_height,
+                        ),
                     });
                 }
             }
@@ -2040,24 +2183,6 @@ impl AppModel {
         self.restore_temporary_workspaces.clear();
         let mut temporary_workspace_number = 0usize;
         for output in &mut snapshot.outputs {
-            let current_size = output
-                .name
-                .as_deref()
-                .and_then(|name| self.raw_outputs.get(name))
-                .and_then(|current| current.logical.as_ref())
-                .map(|logical| (logical.width, logical.height));
-            if let Some((current_width, current_height)) = current_size {
-                for window in output
-                    .workspaces
-                    .iter_mut()
-                    .flat_map(|workspace| &mut workspace.windows)
-                {
-                    window.width =
-                        scaled_restore_dimension(window.width, output.width, current_width);
-                    window.height =
-                        scaled_restore_dimension(window.height, output.height, current_height);
-                }
-            }
             if let Some(output_name) = &output.name {
                 self.send_action(Action::FocusMonitor {
                     output: output_name.clone(),
@@ -2095,7 +2220,7 @@ impl AppModel {
                     let existing_id = self.raw_windows.values().find_map(|window| {
                         (!used_window_ids.contains(&window.id)
                             && window.app_id.as_deref().is_some_and(|app_id| {
-                                restore_app_ids_match(app_id, &window_snapshot.app_id)
+                                app_ids_equivalent(app_id, &window_snapshot.app_id)
                             }))
                         .then_some(window.id)
                     });
@@ -2147,18 +2272,29 @@ impl AppModel {
                 id: Some(window_id),
             }
         });
-        if snapshot.width > 0.0 {
+        if let Some(change) = snapshot.width.to_niri_size_change() {
             self.send_action(Action::SetWindowWidth {
                 id: Some(window_id),
-                change: niri_ipc::SizeChange::SetFixed(snapshot.width as i32),
+                change,
             });
         }
-        if snapshot.height > 0.0 {
+        if !snapshot.floating && snapshot.height.is_full_proportion() {
+            self.send_action(Action::ResetWindowHeight {
+                id: Some(window_id),
+            });
+        } else if let Some(change) = snapshot.height.to_niri_size_change() {
             self.send_action(Action::SetWindowHeight {
                 id: Some(window_id),
-                change: niri_ipc::SizeChange::SetFixed(snapshot.height as i32),
+                change,
             });
         }
+        self.window_size_modes.insert(
+            window_id,
+            WindowSizeModes {
+                width: Some(snapshot.width),
+                height: Some(snapshot.height),
+            },
+        );
         self.send_action(Action::FocusWindow { id: window_id });
         if snapshot.column > 0 {
             self.send_action(Action::MoveColumnToIndex {
@@ -2175,7 +2311,7 @@ impl AppModel {
             window
                 .app_id
                 .as_deref()
-                .is_some_and(|app_id| restore_app_ids_match(app_id, &snapshot.app_id))
+                .is_some_and(|app_id| app_ids_equivalent(app_id, &snapshot.app_id))
         }) else {
             return false;
         };
@@ -2216,12 +2352,82 @@ impl AppModel {
             .map(|w| w.id);
     }
 
+    fn prune_window_size_modes(&mut self) {
+        self.window_size_modes
+            .retain(|window_id, _| self.raw_windows.contains_key(window_id));
+    }
+
+    fn refresh_outputs(&mut self) -> Task<cosmic::Action<Message>> {
+        if self.output_refresh_pending {
+            return Task::none();
+        }
+        self.output_refresh_pending = true;
+        fetch_outputs_async().map(cosmic::Action::from)
+    }
+
+    fn update_outputs(&mut self, outputs: HashMap<String, Output>) {
+        let changed_outputs: HashSet<String> = outputs
+            .iter()
+            .filter(|(name, output)| {
+                Self::logical_output_size(Some(output))
+                    != Self::logical_output_size(self.raw_outputs.get(*name))
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        self.raw_outputs = outputs;
+
+        if changed_outputs.is_empty() {
+            return;
+        }
+        let height_actions: Vec<(u64, niri_ipc::SizeChange)> = self
+            .raw_windows
+            .values()
+            .filter(|window| {
+                window
+                    .workspace_id
+                    .and_then(|workspace_id| self.raw_workspaces.get(&workspace_id))
+                    .and_then(|workspace| workspace.output.as_ref())
+                    .is_some_and(|output| changed_outputs.contains(output))
+            })
+            .filter_map(|window| {
+                self.window_size_modes
+                    .get(&window.id)
+                    .and_then(|modes| modes.height)
+                    .filter(|size| {
+                        matches!(size, SizeSpec::Proportion(_))
+                            && (window.is_floating || !size.is_full_proportion())
+                    })
+                    .and_then(SizeSpec::to_niri_size_change)
+                    .map(|change| (window.id, change))
+            })
+            .collect();
+
+        if !height_actions.is_empty() {
+            log::info!(
+                "Reapplying {} proportional window heights after output size change",
+                height_actions.len()
+            );
+        }
+        for (window_id, change) in height_actions {
+            self.send_action(Action::SetWindowHeight {
+                id: Some(window_id),
+                change,
+            });
+        }
+    }
+
+    fn logical_output_size(output: Option<&Output>) -> Option<(u32, u32)> {
+        output
+            .and_then(|output| output.logical.as_ref())
+            .map(|logical| (logical.width, logical.height))
+    }
+
     fn canonical_app_id(&mut self, app_id: &str) -> String {
         if let Some(canonical) = self.canonical_app_ids.get(app_id) {
             return canonical.clone();
         }
 
-        let canonical = crate::utils::resolve_canonical_desktop_id(app_id);
+        let canonical = crate::applications::resolve_canonical_desktop_id(app_id);
         self.canonical_app_ids
             .insert(app_id.to_owned(), canonical.clone());
         self.canonical_app_ids
@@ -2354,10 +2560,10 @@ impl AppModel {
     fn pre_cache_pinned_desktop_paths(&mut self) {
         for app_id in self.pinned.clone() {
             if !self.desktop_info_cache.contains_key(&app_id)
-                && let Some(path) = crate::utils::find_desktop_file_path(&app_id)
+                && let Some(path) = crate::applications::find_desktop_file_path(&app_id)
             {
-                let name =
-                    crate::utils::get_desktop_entry_name(&path).unwrap_or_else(|| app_id.clone());
+                let name = crate::applications::get_desktop_entry_name(&path)
+                    .unwrap_or_else(|| app_id.clone());
                 self.desktop_info_cache
                     .insert(app_id, DesktopAppInfo { path, name });
             }
@@ -2389,35 +2595,19 @@ impl AppModel {
 
     /// Calculates current column width percentage for a window from layout dynamically.
     fn calculate_window_width_pct(&self, window_id: u64) -> u32 {
-        let w = match self.raw_windows.get(&window_id) {
-            Some(w) => w,
+        let window = match self.raw_windows.get(&window_id) {
+            Some(window) => window,
             None => return 50,
         };
-
-        let (tile_w, _tile_h) = w.layout.tile_size;
-
-        if tile_w <= 0.0 {
-            return 50;
-        }
-
-        let output_w = w
+        let output_width = window
             .workspace_id
             .and_then(|ws_id| self.raw_workspaces.get(&ws_id))
             .and_then(|ws| ws.output.as_ref())
             .and_then(|output_name| self.raw_outputs.get(output_name))
             .and_then(|output| output.logical.as_ref())
             .map(|logical| logical.width as f64)
-            .filter(|&w| w > 0.0);
-
-        if let Some(w) = output_w {
-            let mut pct = (tile_w / w * 100.0).ceil() as u32;
-            if pct >= 98 {
-                pct = 100;
-            }
-            return pct.clamp(10, 100);
-        }
-
-        50
+            .filter(|width| *width > 0.0);
+        column_width_percentage(window.layout.tile_size.0, output_width)
     }
 }
 
@@ -2432,25 +2622,30 @@ fn fetch_outputs_async() -> Task<Message> {
             }
             None
         },
-        |res| match res {
-            Some(o) => Message::OutputsUpdated(o),
-            None => Message::Hover(None),
-        },
+        Message::OutputsRefreshFinished,
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::scaled_restore_dimension;
+    use super::IconCache;
 
     #[test]
-    fn restore_dimension_tracks_output_resolution() {
-        assert_eq!(scaled_restore_dimension(960.0, Some(1920), 2560), 1280.0);
-        assert_eq!(scaled_restore_dimension(540.0, Some(1080), 1440), 720.0);
-    }
+    fn icon_cache_changes_generation_only_for_a_new_theme() {
+        let mut cache = IconCache {
+            theme: "First".to_owned(),
+            ..IconCache::default()
+        };
+        cache.resolving.insert("demo".to_owned());
+        let initial_generation = cache.generation;
 
-    #[test]
-    fn legacy_restore_dimension_remains_absolute() {
-        assert_eq!(scaled_restore_dimension(960.0, None, 2560), 960.0);
+        assert!(!cache.switch_theme("First".to_owned()));
+        assert!(cache.resolving.contains("demo"));
+        assert!(cache.accepts(initial_generation));
+
+        assert!(cache.switch_theme("Second".to_owned()));
+        assert!(cache.resolving.is_empty());
+        assert!(!cache.accepts(initial_generation));
+        assert!(cache.accepts(initial_generation.wrapping_add(1)));
     }
 }

@@ -1,7 +1,9 @@
 use kdl::{KdlDocument, KdlNode, KdlValue};
 use std::path::{Path, PathBuf};
 
-pub const SESSION_VERSION: i128 = 1;
+use crate::layout::SizeSpec;
+
+pub const SESSION_VERSION: i128 = 2;
 const MAX_SESSION_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -27,8 +29,8 @@ pub struct WindowSnapshot {
     pub tile: usize,
     pub floating: bool,
     pub focused: bool,
-    pub width: f64,
-    pub height: f64,
+    pub width: SizeSpec,
+    pub height: SizeSpec,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -115,8 +117,8 @@ pub fn serialize(snapshot: &SessionSnapshot) -> String {
                 window_node.insert("t", window.tile as i128);
                 window_node.insert("f", window.floating);
                 window_node.insert("focused", window.focused);
-                window_node.insert("w", window.width);
-                window_node.insert("h", window.height);
+                insert_size(&mut window_node, window.width, "wp", "wf");
+                insert_size(&mut window_node, window.height, "hp", "hf");
                 workspace_children.nodes_mut().push(window_node);
             }
             output_children.nodes_mut().push(workspace_node);
@@ -174,12 +176,8 @@ pub fn parse(content: &str) -> Result<SessionSnapshot, String> {
                         tile: required_usize(window_node, "t")?,
                         floating: property_bool(window_node, "f").unwrap_or(false),
                         focused: property_bool(window_node, "focused").unwrap_or(false),
-                        width: property_number(window_node, "w")
-                            .unwrap_or_default()
-                            .max(0.0),
-                        height: property_number(window_node, "h")
-                            .unwrap_or_default()
-                            .max(0.0),
+                        width: required_size(window_node, "wp", "wf")?,
+                        height: required_size(window_node, "hp", "hf")?,
                     });
                 }
             }
@@ -251,6 +249,31 @@ fn property_number(node: &KdlNode, name: &str) -> Option<f64> {
         .filter(|value| value.is_finite())
 }
 
+fn insert_size(node: &mut KdlNode, size: SizeSpec, proportion: &str, fixed: &str) {
+    match size {
+        SizeSpec::Proportion(value) => node.insert(proportion, value),
+        SizeSpec::Fixed(value) => node.insert(fixed, value),
+    };
+}
+
+fn required_size(node: &KdlNode, proportion: &str, fixed: &str) -> Result<SizeSpec, String> {
+    match (
+        property_number(node, proportion),
+        property_number(node, fixed),
+    ) {
+        (Some(value), None) if value > 0.0 => Ok(SizeSpec::Proportion(value)),
+        (None, Some(value)) if value > 0.0 && value <= f64::from(i32::MAX) => {
+            Ok(SizeSpec::Fixed(value))
+        }
+        (Some(_), Some(_)) => Err(format!(
+            "session properties '{proportion}' and '{fixed}' are mutually exclusive"
+        )),
+        _ => Err(format!(
+            "session requires one valid size property: '{proportion}' or '{fixed}'"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,30 +295,55 @@ mod tests {
                         tile: 1,
                         floating: true,
                         focused: true,
-                        width: 800.0,
-                        height: 600.0,
+                        width: SizeSpec::Proportion(0.5),
+                        height: SizeSpec::Fixed(600.0),
                     }],
                 }],
             }],
         };
-        assert_eq!(parse(&serialize(&snapshot)).unwrap(), snapshot);
+        let serialized = serialize(&snapshot);
+        assert!(serialized.contains("wp=0.5"));
+        assert!(serialized.contains("hf=600.0"));
+        assert_eq!(parse(&serialized).unwrap(), snapshot);
     }
 
     #[test]
     fn unsupported_version_is_rejected() {
-        assert!(parse("format-version 2").is_err());
+        assert!(parse("format-version 1").is_err());
     }
 
     #[test]
     fn invalid_layout_indices_are_rejected() {
         let content = r#"
-            format-version 1
+            format-version 2
             output name="DP-1" {
                 workspace id=1 idx=1 {
-                    window app="demo" c=-1 t=1 w=10.0 h=10.0
+                    window app="demo" c=-1 t=1 wp=0.5 hp=1.0
                 }
             }
         "#;
         assert!(parse(content).is_err());
+    }
+
+    #[test]
+    fn missing_or_ambiguous_size_modes_are_rejected() {
+        let missing = r#"
+            format-version 2
+            output {
+                workspace id=1 idx=1 {
+                    window app="demo" c=1 t=1 hp=1.0
+                }
+            }
+        "#;
+        let ambiguous = r#"
+            format-version 2
+            output {
+                workspace id=1 idx=1 {
+                    window app="demo" c=1 t=1 wp=0.5 wf=800.0 hp=1.0
+                }
+            }
+        "#;
+        assert!(parse(missing).is_err());
+        assert!(parse(ambiguous).is_err());
     }
 }

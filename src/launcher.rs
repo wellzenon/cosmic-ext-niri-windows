@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::Path;
 
 /// Helper to check if running inside a Flatpak container.
@@ -44,7 +45,7 @@ impl SystemLauncher {
             has_uwsm: binary_exists("uwsm"),
             has_gtk_launch: binary_exists("gtk-launch"),
             has_gio: binary_exists("gio"),
-            default_terminal: crate::utils::get_default_terminal_emulator(),
+            default_terminal: default_terminal_emulator(),
         };
         log::info!(
             "SystemLauncher detected: flatpak={}, uwsm={}, gtk-launch={}, gio={}, default_terminal={:?}",
@@ -164,4 +165,64 @@ impl SystemLauncher {
         log::debug!("Launch command for '{}': {:?}", app_id, final_cmd);
         final_cmd
     }
+}
+
+/// Resolves the user's configured terminal command without hardcoding a
+/// specific emulator.
+fn default_terminal_emulator() -> Option<String> {
+    if let Ok(terminal) = std::env::var("TERMINAL") {
+        let terminal = terminal.trim();
+        if !terminal.is_empty() {
+            return Some(terminal.to_string());
+        }
+    }
+    if let Some(config_dir) = dirs::config_dir() {
+        for file in ["xdg-terminals.list", "xdg-default-terminal.list"] {
+            let path = config_dir.join(file);
+            let Ok(content) = fs::read_to_string(path) else {
+                continue;
+            };
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let desktop_id = line.strip_suffix(".desktop").unwrap_or(line);
+                let binary = desktop_id.split('.').next_back().unwrap_or(desktop_id);
+                if !binary.is_empty() {
+                    return Some(binary.to_string());
+                }
+            }
+        }
+    }
+    for (program, args) in [
+        (
+            "gsettings",
+            &[
+                "get",
+                "org.gnome.desktop.default-applications.terminal",
+                "exec",
+            ][..],
+        ),
+        (
+            "dconf",
+            &[
+                "read",
+                "/org/gnome/desktop/default-applications/terminal/exec",
+            ][..],
+        ),
+    ] {
+        let Ok(output) = std::process::Command::new(program).args(args).output() else {
+            continue;
+        };
+        let terminal = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .trim_matches('\'')
+            .trim_matches('"')
+            .to_string();
+        if !terminal.is_empty() {
+            return Some(terminal);
+        }
+    }
+    None
 }

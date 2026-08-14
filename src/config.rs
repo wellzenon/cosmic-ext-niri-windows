@@ -35,7 +35,7 @@ fn migrate_legacy() -> Result<AppConfig, String> {
     {
         config.pinned = pinned
             .into_iter()
-            .map(|id| crate::utils::resolve_canonical_desktop_id(&id))
+            .map(|id| crate::applications::resolve_canonical_desktop_id(&id))
             .collect();
     }
     if let Some(path) = crate::session::session_path() {
@@ -124,7 +124,7 @@ pub fn parse(content: &str) -> Result<AppConfig, String> {
                     for pinned_node in pinned_children.nodes() {
                         config
                             .pinned
-                            .push(crate::utils::resolve_canonical_desktop_id(
+                            .push(crate::applications::resolve_canonical_desktop_id(
                                 pinned_node.name().value(),
                             ));
                     }

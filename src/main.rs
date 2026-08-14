@@ -1,9 +1,13 @@
 mod app;
+mod applications;
 mod config;
+mod icons;
 mod launcher;
+mod layout;
 mod niri;
+mod niri_config;
 mod session;
-mod utils;
+mod ui;
 
 fn main() -> cosmic::iced::Result {
     // Initialize standard logging with default level for our crate
