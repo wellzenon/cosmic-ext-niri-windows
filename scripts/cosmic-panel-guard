@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+readonly PANEL_PROTOCOL_ERROR="tried to grab after being mapped"
+readonly PANEL_RESTART_EXIT_STATUS=75
+readonly PANEL_BINARY="${COSMIC_PANEL_BINARY:-/usr/bin/cosmic-panel}"
+
+guard_pid=$$
+panel_pid=""
+protocol_error_detected=0
+stopping=0
+
+stop_panel() {
+    if [ -n "$panel_pid" ] && kill -0 "$panel_pid" 2>/dev/null; then
+        kill -TERM "$panel_pid" 2>/dev/null || true
+    fi
+}
+
+request_restart() {
+    protocol_error_detected=1
+    stop_panel
+}
+
+forward_stop() {
+    stopping=1
+    stop_panel
+}
+
+monitor_panel_output() {
+    while IFS= read -r line; do
+        printf '%s\n' "$line"
+        if [[ "$line" == *"$PANEL_PROTOCOL_ERROR"* ]]; then
+            printf '%s\n' \
+                "cosmic-panel-guard: popup protocol error detected; requesting service restart" \
+                >&2
+            kill -USR1 "$guard_pid"
+            return
+        fi
+    done
+}
+
+trap request_restart USR1
+trap forward_stop TERM INT HUP
+
+"$PANEL_BINARY" "$@" > >(monitor_panel_output) 2>&1 &
+panel_pid=$!
+
+wait "$panel_pid"
+panel_status=$?
+
+if [ "$protocol_error_detected" -eq 1 ]; then
+    stop_panel
+    wait "$panel_pid" 2>/dev/null || true
+    exit "$PANEL_RESTART_EXIT_STATUS"
+fi
+
+if [ "$stopping" -eq 1 ]; then
+    exit 0
+fi
+
+exit "$panel_status"
