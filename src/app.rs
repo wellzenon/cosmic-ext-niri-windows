@@ -112,10 +112,34 @@ pub struct ContextMenuState {
     pub snapshot_age: Option<String>,
 }
 
+impl ContextMenuState {
+    fn handle_surface_closed(&mut self, id: Id) {
+        if self.popup_id.as_ref() == Some(&id) {
+            self.popup_id = None;
+            self.target = None;
+            self.snapshot_age = None;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct WindowSizeModes {
     width: Option<SizeSpec>,
     height: Option<SizeSpec>,
+}
+
+fn find_unmatched_window_by_app_id(
+    open_windows: &HashMap<u64, String>,
+    matched_window_ids: &HashSet<u64>,
+    requested_app_id: &str,
+) -> Option<u64> {
+    open_windows
+        .iter()
+        .filter(|(window_id, app_id)| {
+            !matched_window_ids.contains(window_id) && app_ids_equivalent(app_id, requested_app_id)
+        })
+        .map(|(window_id, _)| *window_id)
+        .min()
 }
 
 #[derive(Default)]
@@ -166,7 +190,6 @@ impl IconCache {
 pub struct AppModel {
     // ── Core ──────────────────────────────────────────────
     core: cosmic::Core,
-    launcher: crate::launcher::SystemLauncher,
     action_tx: Option<cosmic::iced::futures::channel::mpsc::Sender<niri_ipc::Action>>,
 
     // ── Niri Data ─────────────────────────────────────────
@@ -176,6 +199,7 @@ pub struct AppModel {
     ordered_workspace_ids: Vec<u64>,
     windows_by_workspace: HashMap<u64, Vec<u64>>,
     open_app_ids: HashSet<String>,
+    global_window_app_ids: HashMap<u64, String>,
     column_presets: Vec<crate::niri_config::ColumnPreset>,
     window_size_modes: HashMap<u64, WindowSizeModes>,
     output_refresh_pending: bool,
@@ -207,6 +231,7 @@ pub struct AppModel {
     latest_session_generation: Arc<AtomicU64>,
     restoring_session: bool,
     pending_restore: Vec<(WorkspaceSnapshot, WindowSnapshot)>,
+    restore_matched_window_ids: HashSet<u64>,
     restore_temporary_workspaces: Vec<String>,
     restore_snapshot: Option<SessionSnapshot>,
 }
@@ -232,6 +257,7 @@ pub enum Message {
     WorkspaceScrollDown,
     WorkspaceScrollUp,
     Surface(cosmic::surface::Action),
+    PopupClosed(Id),
     Error(String),
     OutputsRefreshFinished(Option<HashMap<String, Output>>),
     ToggleShowWorkspaceName(bool),
@@ -239,6 +265,7 @@ pub enum Message {
     ToggleFixedSnapshot(bool),
     LaunchPendingSessionWindows,
     FinishSessionRestore,
+    SessionRestoreTimedOut,
     SessionSnapshotReady {
         generation: u64,
         snapshot: SessionSnapshot,
@@ -283,6 +310,10 @@ impl cosmic::Application for AppModel {
 
     fn core_mut(&mut self) -> &mut cosmic::Core {
         &mut self.core
+    }
+
+    fn on_close_requested(&self, id: Id) -> Option<Self::Message> {
+        Some(Message::PopupClosed(id))
     }
 
     fn init(
@@ -333,7 +364,7 @@ impl cosmic::Application for AppModel {
             ordered_workspace_ids: Vec::new(),
             windows_by_workspace: HashMap::new(),
             open_app_ids: HashSet::new(),
-            launcher: crate::launcher::SystemLauncher::detect(),
+            global_window_app_ids: HashMap::new(),
             icons: IconCache::default(),
             menu: ContextMenuState::default(),
             drag: DragState::default(),
@@ -344,6 +375,7 @@ impl cosmic::Application for AppModel {
             latest_session_generation: Arc::new(AtomicU64::new(0)),
             restoring_session: false,
             pending_restore: Vec::new(),
+            restore_matched_window_ids: HashSet::new(),
             restore_temporary_workspaces: Vec::new(),
             restore_snapshot: loaded_session.filter(|_| session_enabled),
             config,
@@ -472,7 +504,7 @@ impl cosmic::Application for AppModel {
         let divider_y_padding = ((icon_f * 0.30) / 2.0).max(1.5);
         let divider_x_padding = (icon_f * 0.20).max(3.0);
         let wksp_label_size = icon_f * 0.40;
-        let dot_width = (icon_f * 0.50).max(4.0);
+        let dot_width = (icon_f * 0.80).max(4.0);
         let dot_height = (icon_f * 0.10).max(2.0);
         let dot_radius = dot_height / 2.0;
         let dot_gap = (icon_f * 0.06).max(1.0);
@@ -480,7 +512,7 @@ impl cosmic::Application for AppModel {
         let dot_width_val = if is_horizontal { dot_width } else { dot_height };
         let dot_height_val = if is_horizontal { dot_height } else { dot_width };
 
-        let dot_inactive_len = dot_height * 3.0; // Shorter pill for inactive
+        let dot_inactive_len = dot_height * 2.5; // Shorter pill for inactive
         let dot_inactive_width_val = if is_horizontal {
             dot_inactive_len
         } else {
@@ -672,8 +704,8 @@ impl cosmic::Application for AppModel {
                         )
                         .class(cosmic::theme::Container::custom(
                             move |t| {
-                                let mut color = t.cosmic().accent_color();
-                                color.alpha = 0.3; // 30% opacity for inactive windows
+                                let color = t.cosmic().small_widget_divider();
+                                // color.alpha = 0.3; // 30% opacity for inactive windows
                                 cosmic::widget::container::Style {
                                     background: Some(cosmic::iced::Background::Color(color.into())),
                                     border: cosmic::iced::Border {
@@ -749,7 +781,7 @@ impl cosmic::Application for AppModel {
                         }
                     };
 
-                    let btn_alpha = if is_focused { 0.18 } else { 0.0 };
+                    let btn_alpha = 0.0; // if is_focused { 0.18 } else { 0.0 };
 
                     let btn = widget::button::custom(content)
                         .padding(padding)
@@ -892,7 +924,11 @@ impl cosmic::Application for AppModel {
 
     fn update(&mut self, message: Self::Message) -> Task<cosmic::Action<Self::Message>> {
         match message {
-            Message::InitialData { wins, wksps, outs } => {
+            Message::InitialData {
+                mut wins,
+                wksps,
+                outs,
+            } => {
                 self.raw_outputs = outs;
                 let our_output = &self.core.applet.output_name;
                 self.raw_workspaces = wksps
@@ -902,7 +938,12 @@ impl cosmic::Application for AppModel {
                     .collect();
                 self.rebuild_workspace_order();
 
-                let mut windows: HashMap<u64, Window> = wins
+                for window in &mut wins {
+                    self.normalize_window_app_id(window);
+                }
+                self.rebuild_global_window_app_ids(&wins);
+
+                let windows: HashMap<u64, Window> = wins
                     .into_iter()
                     .filter(|w| {
                         w.workspace_id
@@ -910,9 +951,6 @@ impl cosmic::Application for AppModel {
                     })
                     .map(|w| (w.id, w))
                     .collect();
-                for window in windows.values_mut() {
-                    self.normalize_window_app_id(window);
-                }
                 self.raw_windows = windows;
                 self.rebuild_window_index();
 
@@ -975,6 +1013,9 @@ impl cosmic::Application for AppModel {
             Message::Surface(action) => {
                 return Task::done(cosmic::Action::Cosmic(cosmic::app::Action::Surface(action)));
             }
+            Message::PopupClosed(id) => {
+                self.menu.handle_surface_closed(id);
+            }
             Message::Error(err) => {
                 log::error!("{}", err);
             }
@@ -1003,6 +1044,7 @@ impl cosmic::Application for AppModel {
                 if enabled {
                     self.restore_snapshot = None;
                     self.pending_restore.clear();
+                    self.restore_matched_window_ids.clear();
                     self.restoring_session = false;
                     let save_task = self.schedule_session_save();
                     let config_task =
@@ -1079,6 +1121,9 @@ impl cosmic::Application for AppModel {
                 return Task::batch(vec![snapshot_task, config_task]);
             }
             Message::LaunchPendingSessionWindows => {
+                if self.reconcile_pending_restore() {
+                    return Self::session_restore_transition_task();
+                }
                 let app_ids: Vec<String> = self
                     .pending_restore
                     .iter()
@@ -1089,12 +1134,22 @@ impl cosmic::Application for AppModel {
                 }
             }
             Message::FinishSessionRestore => {
-                for name in std::mem::take(&mut self.restore_temporary_workspaces) {
-                    self.send_action(Action::UnsetWorkspaceName {
-                        reference: Some(niri_ipc::WorkspaceReferenceArg::Name(name)),
-                    });
+                self.finish_session_restore();
+            }
+            Message::SessionRestoreTimedOut => {
+                if self.restoring_session {
+                    let missing = self
+                        .pending_restore
+                        .iter()
+                        .map(|(_, window)| window.app_id.as_str())
+                        .collect::<Vec<_>>();
+                    log::warn!(
+                        "Session restore timed out waiting for windows: {}",
+                        missing.join(", ")
+                    );
+                    self.pending_restore.clear();
+                    self.finish_session_restore();
                 }
-                self.restoring_session = false;
             }
             Message::SessionSaveFinished(result) => {
                 if let Err(error) = result {
@@ -1357,8 +1412,12 @@ impl AppModel {
                 }
                 self.with_session_save(Task::none())
             }
-            Event::WindowsChanged { windows } => {
-                let mut raw_windows: HashMap<u64, Window> = windows
+            Event::WindowsChanged { mut windows } => {
+                for window in &mut windows {
+                    self.normalize_window_app_id(window);
+                }
+                self.rebuild_global_window_app_ids(&windows);
+                let raw_windows: HashMap<u64, Window> = windows
                     .into_iter()
                     .filter(|w| {
                         w.workspace_id
@@ -1366,16 +1425,18 @@ impl AppModel {
                     })
                     .map(|w| (w.id, w))
                     .collect();
-                for window in raw_windows.values_mut() {
-                    self.normalize_window_app_id(window);
-                }
                 self.raw_windows = raw_windows;
                 self.prune_window_size_modes();
                 self.rebuild_window_index();
 
                 self.update_last_focused_window();
                 let icon_task = self.spawn_missing_icon_tasks();
-                self.with_session_save(icon_task)
+                let restore_task = if self.reconcile_pending_restore() {
+                    Self::session_restore_transition_task()
+                } else {
+                    Task::none()
+                };
+                self.with_session_save(Task::batch(vec![icon_task, restore_task]))
             }
             Event::WindowOpenedOrChanged { mut window } => {
                 self.normalize_window_app_id(&mut window);
@@ -1383,6 +1444,12 @@ impl AppModel {
                 let is_focused = window.is_focused;
                 let new_workspace_id = window.workspace_id;
                 let new_app_id = window.app_id.clone();
+                if let Some(app_id) = &new_app_id {
+                    self.global_window_app_ids.insert(id, app_id.clone());
+                } else {
+                    self.global_window_app_ids.remove(&id);
+                }
+                let restore_finished = self.reconcile_pending_restore();
                 let old_window = self.raw_windows.insert(id, window);
                 let old_workspace_id = old_window.as_ref().and_then(|w| w.workspace_id);
                 let old_app_id = old_window.as_ref().and_then(|w| w.app_id.clone());
@@ -1397,22 +1464,13 @@ impl AppModel {
                     if is_focused {
                         self.last_focused_window = Some(id);
                     }
-                    if let Some(window) = self.raw_windows.get(&id).cloned() {
-                        let restore_finished = self.restore_new_window(&window);
-                        let restore_task = if restore_finished {
-                            Self::session_restore_transition_task()
-                        } else {
-                            Task::none()
-                        };
-                        let icon_task = self.spawn_missing_icon_tasks();
-                        return Task::batch(vec![
-                            icon_task,
-                            restore_task,
-                            self.schedule_session_save(),
-                        ]);
-                    }
+                    let restore_task = if restore_finished {
+                        Self::session_restore_transition_task()
+                    } else {
+                        Task::none()
+                    };
                     let icon_task = self.spawn_missing_icon_tasks();
-                    self.with_session_save(icon_task)
+                    self.with_session_save(Task::batch(vec![icon_task, restore_task]))
                 } else {
                     self.raw_windows.remove(&id);
                     self.window_size_modes.remove(&id);
@@ -1425,10 +1483,17 @@ impl AppModel {
                         old_app_id,
                         None,
                     );
-                    self.with_session_save(Task::none())
+                    let restore_task = if restore_finished {
+                        Self::session_restore_transition_task()
+                    } else {
+                        Task::none()
+                    };
+                    self.with_session_save(restore_task)
                 }
             }
             Event::WindowClosed { id } => {
+                self.global_window_app_ids.remove(&id);
+                self.restore_matched_window_ids.remove(&id);
                 let old_window = self.raw_windows.remove(&id);
                 self.window_size_modes.remove(&id);
                 if old_window.is_some() && self.last_focused_window == Some(id) {
@@ -1519,25 +1584,10 @@ impl AppModel {
             None
         };
 
-        let mut is_terminal = false;
-        let mut exec_args = None;
-
-        if let Some(ref path) = path_opt
-            && let Ok(entry) =
-                freedesktop_desktop_entry::DesktopEntry::from_path(path, None::<&[&str]>)
-        {
-            is_terminal = entry.terminal();
-            exec_args = entry.parse_exec().ok();
+        match crate::launcher::build_launch_command(app_id, path_opt.as_deref()) {
+            Ok(command) => self.send_action(Action::Spawn { command }),
+            Err(error) => log::error!("Could not launch '{app_id}': {error}"),
         }
-
-        let cmd = self.launcher.build_command_with_args(
-            app_id,
-            path_opt.as_deref(),
-            is_terminal,
-            exec_args.as_deref(),
-        );
-
-        self.send_action(Action::Spawn { command: cmd });
     }
 
     fn handle_pin_app(&mut self, raw_app_id: String) -> Task<cosmic::Action<Message>> {
@@ -2180,6 +2230,7 @@ impl AppModel {
         }
 
         self.restoring_session = true;
+        self.restore_matched_window_ids.clear();
         self.restore_temporary_workspaces.clear();
         let mut temporary_workspace_number = 0usize;
         for output in &mut snapshot.outputs {
@@ -2211,39 +2262,25 @@ impl AppModel {
             }
         }
 
-        let mut used_window_ids = HashSet::new();
-        let mut pending = Vec::new();
-        let mut focused_window_id = None;
-        for output in &snapshot.outputs {
-            for workspace in &output.workspaces {
-                for window_snapshot in &workspace.windows {
-                    let existing_id = self.raw_windows.values().find_map(|window| {
-                        (!used_window_ids.contains(&window.id)
-                            && window.app_id.as_deref().is_some_and(|app_id| {
-                                app_ids_equivalent(app_id, &window_snapshot.app_id)
-                            }))
-                        .then_some(window.id)
-                    });
-                    if let Some(window_id) = existing_id {
-                        used_window_ids.insert(window_id);
-                        self.apply_window_snapshot(window_id, window_snapshot, workspace);
-                        if window_snapshot.focused {
-                            focused_window_id = Some(window_id);
-                        }
-                    } else {
-                        pending.push((workspace.clone(), window_snapshot.clone()));
-                    }
-                }
+        self.pending_restore.clear();
+        for output in snapshot.outputs {
+            for mut workspace in output.workspaces {
+                let windows = std::mem::take(&mut workspace.windows);
+                self.pending_restore.extend(
+                    windows
+                        .into_iter()
+                        .map(|window| (workspace.clone(), window)),
+                );
             }
         }
-        if let Some(window_id) = focused_window_id {
-            self.send_action(Action::FocusWindow { id: window_id });
-        }
-        self.pending_restore = pending;
-        if self.pending_restore.is_empty() {
+
+        if self.reconcile_pending_restore() {
             Self::session_restore_transition_task()
         } else {
-            Self::pending_session_launch_task()
+            Task::batch(vec![
+                Self::pending_session_launch_task(),
+                Self::session_restore_timeout_task(),
+            ])
         }
     }
 
@@ -2306,17 +2343,49 @@ impl AppModel {
         }
     }
 
-    fn restore_new_window(&mut self, window: &Window) -> bool {
-        let Some(index) = self.pending_restore.iter().position(|(_, snapshot)| {
-            window
-                .app_id
-                .as_deref()
-                .is_some_and(|app_id| app_ids_equivalent(app_id, &snapshot.app_id))
-        }) else {
+    fn rebuild_global_window_app_ids(&mut self, windows: &[Window]) {
+        self.global_window_app_ids = windows
+            .iter()
+            .filter_map(|window| {
+                window
+                    .app_id
+                    .as_ref()
+                    .map(|app_id| (window.id, app_id.clone()))
+            })
+            .collect();
+    }
+
+    /// Matches saved windows against every window reported by Niri. Workspace,
+    /// output and dimensions intentionally do not participate in this check.
+    fn reconcile_pending_restore(&mut self) -> bool {
+        if !self.restoring_session || self.pending_restore.is_empty() {
             return false;
-        };
-        let (workspace, snapshot) = self.pending_restore.remove(index);
-        self.apply_window_snapshot(window.id, &snapshot, &workspace);
+        }
+
+        let mut focused_window_id = None;
+        let mut pending_index = 0;
+
+        while pending_index < self.pending_restore.len() {
+            let requested_app_id = &self.pending_restore[pending_index].1.app_id;
+            let Some(window_id) = find_unmatched_window_by_app_id(
+                &self.global_window_app_ids,
+                &self.restore_matched_window_ids,
+                requested_app_id,
+            ) else {
+                pending_index += 1;
+                continue;
+            };
+            let (workspace, snapshot) = self.pending_restore.remove(pending_index);
+            self.restore_matched_window_ids.insert(window_id);
+            self.apply_window_snapshot(window_id, &snapshot, &workspace);
+            if snapshot.focused {
+                focused_window_id = Some(window_id);
+            }
+        }
+
+        if let Some(window_id) = focused_window_id {
+            self.send_action(Action::FocusWindow { id: window_id });
+        }
         self.pending_restore.is_empty()
     }
 
@@ -2328,6 +2397,26 @@ impl AppModel {
             |_| Message::FinishSessionRestore,
         )
         .map(cosmic::Action::from)
+    }
+
+    fn session_restore_timeout_task() -> Task<cosmic::Action<Message>> {
+        Task::perform(
+            async {
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            },
+            |_| Message::SessionRestoreTimedOut,
+        )
+        .map(cosmic::Action::from)
+    }
+
+    fn finish_session_restore(&mut self) {
+        for name in std::mem::take(&mut self.restore_temporary_workspaces) {
+            self.send_action(Action::UnsetWorkspaceName {
+                reference: Some(niri_ipc::WorkspaceReferenceArg::Name(name)),
+            });
+        }
+        self.restore_matched_window_ids.clear();
+        self.restoring_session = false;
     }
 
     fn pending_session_launch_task() -> Task<cosmic::Action<Message>> {
@@ -2628,7 +2717,9 @@ fn fetch_outputs_async() -> Task<Message> {
 
 #[cfg(test)]
 mod tests {
-    use super::IconCache;
+    use super::{ContextMenuState, IconCache, MenuTarget, find_unmatched_window_by_app_id};
+    use cosmic::iced::window::Id;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn icon_cache_changes_generation_only_for_a_new_theme() {
@@ -2647,5 +2738,58 @@ mod tests {
         assert!(cache.resolving.is_empty());
         assert!(!cache.accepts(initial_generation));
         assert!(cache.accepts(initial_generation.wrapping_add(1)));
+    }
+
+    #[test]
+    fn closed_context_menu_surface_clears_its_popup_state() {
+        let popup_id = Id::unique();
+        let unrelated_id = Id::unique();
+        let mut menu = ContextMenuState {
+            popup_id: Some(popup_id),
+            target: Some(MenuTarget::Applet),
+            snapshot_age: Some("now".to_owned()),
+        };
+
+        menu.handle_surface_closed(unrelated_id);
+        assert_eq!(menu.popup_id, Some(popup_id));
+
+        menu.handle_surface_closed(popup_id);
+        assert_eq!(menu.popup_id, None);
+        assert_eq!(menu.target, None);
+        assert_eq!(menu.snapshot_age, None);
+    }
+
+    #[test]
+    fn session_restore_matches_open_windows_only_by_app_id() {
+        let open_windows = HashMap::from([
+            (11, "nvim".to_owned()),
+            (12, "foot".to_owned()),
+            (13, "librewolf".to_owned()),
+        ]);
+        let mut matched_window_ids = HashSet::new();
+
+        for app_id in ["nvim", "foot", "librewolf"] {
+            let window_id =
+                find_unmatched_window_by_app_id(&open_windows, &matched_window_ids, app_id)
+                    .expect("an open window with the same app-id must satisfy the snapshot");
+            matched_window_ids.insert(window_id);
+        }
+
+        assert_eq!(matched_window_ids, HashSet::from([11, 12, 13]));
+    }
+
+    #[test]
+    fn session_restore_does_not_reuse_one_window_for_duplicate_snapshot_entries() {
+        let open_windows = HashMap::from([(21, "foot".to_owned())]);
+        let mut matched_window_ids = HashSet::new();
+
+        let first = find_unmatched_window_by_app_id(&open_windows, &matched_window_ids, "foot")
+            .expect("the first snapshot entry should match the open Foot window");
+        matched_window_ids.insert(first);
+
+        assert_eq!(
+            find_unmatched_window_by_app_id(&open_windows, &matched_window_ids, "foot"),
+            None
+        );
     }
 }

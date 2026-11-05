@@ -1,65 +1,38 @@
-use cosmic_ext_niri_windows::launcher::SystemLauncher;
+use cosmic_ext_niri_windows::launcher::{build_launch_command, resolve_desktop_launch};
 use std::path::Path;
 
 #[test]
-fn test_system_launcher_detection() {
-    let launcher = SystemLauncher::detect();
-    println!(">>> DETECTED SYSTEM LAUNCHER CAPABILITIES: {:?}", launcher);
+fn test_desktop_exec_resolution_preserves_losange_shell_argument() {
+    let path = std::env::temp_dir().join(format!(
+        "cosmic-ext-niri-windows-launcher-{}.desktop",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        "[Desktop Entry]\nType=Application\nName=Losange\nExec=sh -c \"/usr/bin/losange -o '%u'\"\nTerminal=false\n",
+    )
+    .expect("test desktop entry should be writable");
+
+    let launch = resolve_desktop_launch(&path).expect("desktop entry should resolve");
+
+    assert_eq!(launch.exec, "sh -c \"/usr/bin/losange -o '%u'\"");
+    assert!(!launch.terminal);
+
+    let command = build_launch_command("xyz.timtimtim.Losange", Some(&path))
+        .expect("desktop entry should build a launch command");
     assert!(
-        launcher.has_uwsm
-            || launcher.has_gtk_launch
-            || launcher.has_gio
-            || launcher.default_terminal.is_some()
+        command.ends_with(&[
+            "uwsm".to_string(),
+            "app".to_string(),
+            "--".to_string(),
+            "sh".to_string(),
+            "-c".to_string(),
+            "/usr/bin/losange -o '%u'".to_string(),
+        ]),
+        "unexpected launch command: {command:?}"
     );
-}
 
-#[test]
-fn test_system_launcher_build_command() {
-    let launcher = SystemLauncher::detect();
-    let cmd = launcher.build_command_with_args(
-        "org.neovim.nvim",
-        Some(Path::new("/usr/share/applications/org.neovim.nvim.desktop")),
-        true,
-        Some(&["nvim".to_string()]),
-    );
-    println!(">>> BUILT COMMAND FOR NEOVIM: {:?}", cmd);
-    assert!(!cmd.is_empty());
-}
-
-#[test]
-fn test_launcher_keeps_exec_arguments_outside_a_shell() {
-    let launcher = SystemLauncher {
-        is_flatpak: false,
-        has_uwsm: false,
-        has_gtk_launch: false,
-        has_gio: false,
-        default_terminal: None,
-    };
-    let args = vec![
-        "sh".to_string(),
-        "-c".to_string(),
-        "touch /tmp/pwned".to_string(),
-    ];
-    let command = launcher.build_command_with_args("demo", None, false, Some(&args));
-
-    assert_eq!(command, args);
-}
-
-#[test]
-fn test_empty_terminal_configuration_does_not_fall_back_to_shell() {
-    let launcher = SystemLauncher {
-        is_flatpak: false,
-        has_uwsm: false,
-        has_gtk_launch: false,
-        has_gio: false,
-        default_terminal: Some(String::new()),
-    };
-    let args = vec!["demo".to_string(), "--safe".to_string()];
-
-    assert_eq!(
-        launcher.build_command_with_args("demo", None, true, Some(&args)),
-        args
-    );
+    std::fs::remove_file(path).expect("test desktop entry should be removable");
 }
 
 #[test]
